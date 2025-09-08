@@ -1,262 +1,127 @@
 package llm
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
 	"time"
+
+	"LLM_Chat/pkg/llm/providers"
 
 	"go.uber.org/zap"
 )
 
+// Client обертка над провайдерами для обратной совместимости
 type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
-	logger     *zap.Logger
+	provider providers.Provider
+	logger   *zap.Logger
 }
 
+// Message совместимый тип (переиспользуем из providers)
+type Message = providers.Message
+
+// ChatResponse совместимый тип
+type ChatResponse = providers.ChatResponse
+
+// Choice совместимый тип
+type Choice = providers.Choice
+
+// Delta совместимый тип
+type Delta = providers.Delta
+
+// Usage совместимый тип
+type Usage = providers.Usage
+
+// StreamChunk совместимый тип
+type StreamChunk = providers.StreamChunk
+
+// Config конфигурация для клиента
 type Config struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	Timeout time.Duration
+	Provider string        `mapstructure:"provider"` // новое поле
+	BaseURL  string        `mapstructure:"base_url"`
+	APIKey   string        `mapstructure:"api_key"`
+	Model    string        `mapstructure:"model"`
+	Timeout  time.Duration `mapstructure:"timeout"`
 }
 
-// OpenRouter API structs
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+// NewClient создает новый клиент с выбранным провайдером
+func NewClient(config Config, logger *zap.Logger) (*Client, error) {
+	// Конвертируем в конфиг провайдера
+	providerConfig := providers.Config{
+		Provider: config.Provider,
+		BaseURL:  config.BaseURL,
+		APIKey:   config.APIKey,
+		Model:    config.Model,
+		Timeout:  config.Timeout,
+	}
 
-type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-}
-
-type ChatResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage"`
-}
-
-type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	Delta        Delta   `json:"delta,omitempty"`
-	FinishReason string  `json:"finish_reason"`
-}
-
-type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
-}
-
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-type StreamResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-}
-
-func NewClient(config Config, logger *zap.Logger) *Client {
-	if config.Timeout == 0 {
-		config.Timeout = 60 * time.Second
+	// Создаем фабрику и провайдер
+	factory := providers.NewFactory(logger)
+	provider, err := factory.CreateProvider(providerConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create provider: %w", err)
 	}
 
 	return &Client{
-		baseURL: config.BaseURL,
-		apiKey:  config.APIKey,
-		model:   config.Model,
-		httpClient: &http.Client{
-			Timeout: config.Timeout,
-		},
-		logger: logger,
+		provider: provider,
+		logger:   logger,
+	}, nil
+}
+
+// NewClientWithProvider создает клиент с готовым провайдером
+func NewClientWithProvider(provider providers.Provider, logger *zap.Logger) *Client {
+	return &Client{
+		provider: provider,
+		logger:   logger,
 	}
 }
 
-// ChatCompletion выполняет запрос к LLM и возвращает полный ответ
+// ChatCompletion выполняет запрос к LLM (делегирует провайдеру)
 func (c *Client) ChatCompletion(ctx context.Context, messages []Message) (*ChatResponse, error) {
-	req := ChatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		MaxTokens:   1000,
-		Stream:      false,
-		Temperature: 0.7,
-	}
-
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	c.logger.Debug("Sending LLM request",
-		zap.String("model", c.model),
+	c.logger.Debug("Executing chat completion",
+		zap.String("provider", c.provider.GetName()),
 		zap.Int("messages_count", len(messages)),
-		zap.String("request_body", string(reqBody)),
 	)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		c.logger.Error("LLM API error",
-			zap.Int("status_code", resp.StatusCode),
-			zap.String("response_body", string(body)),
-		)
-		return nil, fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	c.logger.Debug("LLM response received",
-		zap.String("response_id", chatResp.ID),
-		zap.Int("total_tokens", chatResp.Usage.TotalTokens),
-	)
-
-	return &chatResp, nil
+	return c.provider.ChatCompletion(ctx, messages)
 }
 
 // ChatCompletionStream выполняет стриминговый запрос к LLM
 func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message) (<-chan StreamChunk, error) {
-	req := ChatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		MaxTokens:   1000,
-		Stream:      true,
-		Temperature: 0.7,
-	}
-
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	c.logger.Debug("Sending streaming LLM request",
-		zap.String("model", c.model),
+	c.logger.Debug("Executing streaming chat completion",
+		zap.String("provider", c.provider.GetName()),
 		zap.Int("messages_count", len(messages)),
 	)
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	httpReq.Header.Set("Accept", "text/event-stream")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		c.logger.Error("LLM API streaming error",
-			zap.Int("status_code", resp.StatusCode),
-			zap.String("response_body", string(body)),
-		)
-		return nil, fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
-	}
-
-	chunks := make(chan StreamChunk, 100)
-
-	go c.handleStreamResponse(ctx, resp.Body, chunks)
-
-	return chunks, nil
+	return c.provider.ChatCompletionStream(ctx, messages)
 }
 
-type StreamChunk struct {
-	Content string
-	Done    bool
-	Error   error
+// GetProviderName возвращает имя используемого провайдера
+func (c *Client) GetProviderName() string {
+	return c.provider.GetName()
 }
 
-func (c *Client) handleStreamResponse(ctx context.Context, body io.ReadCloser, chunks chan<- StreamChunk) {
-	defer close(chunks)
-	defer body.Close()
+// GetSupportedModels возвращает список поддерживаемых моделей текущего провайдера
+func (c *Client) GetSupportedModels() []string {
+	return c.provider.GetSupportedModels()
+}
 
-	scanner := bufio.NewScanner(body)
+// ValidateProvider проверяет, поддерживается ли провайдер
+func ValidateProvider(providerName string, logger *zap.Logger) error {
+	factory := providers.NewFactory(logger)
+	supportedProviders := factory.GetSupportedProviders()
 
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			chunks <- StreamChunk{Error: ctx.Err()}
-			return
-		default:
-		}
-
-		line := scanner.Text()
-
-		// Server-Sent Events format: "data: {...}"
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-
-		// Конец стрима
-		if data == "[DONE]" {
-			chunks <- StreamChunk{Done: true}
-			return
-		}
-
-		var streamResp StreamResponse
-		if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
-			c.logger.Warn("Failed to parse stream chunk", zap.Error(err), zap.String("data", data))
-			continue
-		}
-
-		if len(streamResp.Choices) > 0 {
-			choice := streamResp.Choices[0]
-			if choice.Delta.Content != "" {
-				chunks <- StreamChunk{Content: choice.Delta.Content}
-			}
-
-			if choice.FinishReason != "" {
-				chunks <- StreamChunk{Done: true}
-				return
-			}
+	for _, supported := range supportedProviders {
+		if supported == providerName {
+			return nil
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		chunks <- StreamChunk{Error: fmt.Errorf("scanner error: %w", err)}
-	}
+	return fmt.Errorf("unsupported provider '%s', supported providers: %v",
+		providerName, supportedProviders)
+}
+
+// GetSupportedProviders возвращает список всех поддерживаемых провайдеров
+func GetSupportedProviders(logger *zap.Logger) []string {
+	factory := providers.NewFactory(logger)
+	return factory.GetSupportedProviders()
 }

@@ -33,9 +33,10 @@ type ChatConfig struct {
 }
 
 type LLMConfig struct {
-	BaseURL string `mapstructure:"base_url"`
-	Model   string `mapstructure:"model"`
-	APIKey  string `mapstructure:"api_key"`
+	Provider string `mapstructure:"provider"` // новое поле: "openrouter", "gemini"
+	BaseURL  string `mapstructure:"base_url"`
+	Model    string `mapstructure:"model"`
+	APIKey   string `mapstructure:"api_key"`
 }
 
 func Load() (*Config, error) {
@@ -48,6 +49,9 @@ func Load() (*Config, error) {
 	viper.AutomaticEnv()
 	viper.SetEnvPrefix("CHAT_LLM")
 
+	// Устанавливаем значения по умолчанию
+	setDefaults()
+
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
@@ -57,14 +61,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// Логика для API ключа:
-	// 1. Если в config.yaml указан ключ - используем его
-	// 2. Если в config.yaml пусто - пробуем переменную окружения
-	// 3. Если нигде нет - ошибка
+	// Обработка API ключей для разных провайдеров
 	if strings.TrimSpace(config.LLM.APIKey) == "" {
-		if envAPIKey := viper.GetString("LLM_API_KEY"); envAPIKey != "" {
-			config.LLM.APIKey = envAPIKey
-		}
+		config.LLM.APIKey = getAPIKeyForProvider(config.LLM.Provider)
 	}
 
 	// Валидация критических параметров
@@ -75,10 +74,69 @@ func Load() (*Config, error) {
 	return &config, nil
 }
 
+func setDefaults() {
+	// Server defaults
+	viper.SetDefault("server.host", "localhost")
+	viper.SetDefault("server.port", 8080)
+	viper.SetDefault("server.read_timeout", "30s")
+	viper.SetDefault("server.write_timeout", "30s")
+
+	// Logging defaults
+	viper.SetDefault("logging.level", "info")
+	viper.SetDefault("logging.format", "json")
+
+	// Chat defaults
+	viper.SetDefault("chat.max_messages_per_session", 50)
+	viper.SetDefault("chat.context_window_size", 20)
+
+	// LLM defaults
+	viper.SetDefault("llm.provider", "openrouter")
+	viper.SetDefault("llm.base_url", "https://openrouter.ai/api/v1")
+	viper.SetDefault("llm.model", "google/gemma-3-27b-it:free")
+}
+
+func getAPIKeyForProvider(provider string) string {
+	switch strings.ToLower(provider) {
+	case "openrouter":
+		return viper.GetString("LLM_API_KEY") // CHAT_LLM_LLM_API_KEY
+	case "gemini":
+		// Пробуем специфичные переменные для Gemini
+		if key := viper.GetString("GEMINI_API_KEY"); key != "" {
+			return key
+		}
+		return viper.GetString("LLM_API_KEY") // fallback
+	default:
+		return viper.GetString("LLM_API_KEY")
+	}
+}
+
 func validateConfig(config *Config) error {
+	// Проверяем провайдер
+	supportedProviders := []string{"openrouter", "gemini"}
+	providerValid := false
+	for _, supported := range supportedProviders {
+		if strings.ToLower(config.LLM.Provider) == supported {
+			providerValid = true
+			break
+		}
+	}
+	if !providerValid {
+		return fmt.Errorf("unsupported LLM provider: %s, supported: %v",
+			config.LLM.Provider, supportedProviders)
+	}
+
 	// Проверяем наличие API ключа
 	if strings.TrimSpace(config.LLM.APIKey) == "" {
-		return fmt.Errorf("LLM API key is required. Set it in config.yaml (llm.api_key) or environment variable CHAT_LLM_LLM_API_KEY")
+		return fmt.Errorf(`LLM API key is required. 
+
+Рекомендуемый способ - укажите ключ в config.yaml:
+llm:
+  provider: "%s"
+  api_key: "your_api_key_here"
+
+Альтернативно, используйте переменную окружения: %s`,
+			config.LLM.Provider,
+			strings.Join(GetProviderSpecificEnvVars(config.LLM.Provider), " или "))
 	}
 
 	// Проверяем базовые параметры
@@ -102,26 +160,80 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("LLM model is required")
 	}
 
+	// Валидация специфичная для провайдеров
+	if err := validateProviderSpecific(config); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-// GetConfigSource возвращает информацию о том, откуда взят API ключ
+func validateProviderSpecific(config *Config) error {
+	switch strings.ToLower(config.LLM.Provider) {
+	case "openrouter":
+		// Для OpenRouter проверяем, что URL правильный
+		if !strings.Contains(config.LLM.BaseURL, "openrouter") {
+			return fmt.Errorf("base URL should contain 'openrouter' for OpenRouter provider")
+		}
+	case "gemini":
+		// Для Gemini проверяем, что URL содержит правильный эндпоинт
+		if !strings.Contains(config.LLM.BaseURL, "google") && !strings.Contains(config.LLM.BaseURL, "gemini") {
+			return fmt.Errorf("base URL should contain 'google' or 'gemini' for Gemini provider")
+		}
+		// Проверяем модель
+		if !strings.Contains(config.LLM.Model, "gemini") {
+			return fmt.Errorf("model should contain 'gemini' for Gemini provider")
+		}
+	}
+	return nil
+}
+
+// GetConfigSource возвращает информацию о том, откуда взяты настройки
 func GetConfigSource(config *Config) map[string]string {
 	sources := make(map[string]string)
 
 	// Проверяем, откуда взят API ключ
 	viperAPIKey := viper.GetString("llm.api_key")
-	envAPIKey := viper.GetString("LLM_API_KEY")
+	envAPIKey := getAPIKeyForProvider(config.LLM.Provider)
 
 	if viperAPIKey != "" {
 		sources["api_key"] = "config.yaml"
 	} else if envAPIKey != "" {
-		sources["api_key"] = "environment variable CHAT_LLM_LLM_API_KEY"
+		switch strings.ToLower(config.LLM.Provider) {
+		case "gemini":
+			if viper.GetString("GEMINI_API_KEY") != "" {
+				sources["api_key"] = "environment variable CHAT_LLM_GEMINI_API_KEY"
+			} else {
+				sources["api_key"] = "environment variable CHAT_LLM_LLM_API_KEY"
+			}
+		default:
+			sources["api_key"] = "environment variable CHAT_LLM_LLM_API_KEY"
+		}
 	} else {
 		sources["api_key"] = "not set"
 	}
 
 	sources["config_file"] = viper.ConfigFileUsed()
+	sources["provider"] = config.LLM.Provider
 
 	return sources
+}
+
+// GetProviderSpecificEnvVars возвращает рекомендуемые переменные окружения для провайдера
+func GetProviderSpecificEnvVars(provider string) []string {
+	switch strings.ToLower(provider) {
+	case "openrouter":
+		return []string{
+			"CHAT_LLM_LLM_API_KEY",
+		}
+	case "gemini":
+		return []string{
+			"CHAT_LLM_GEMINI_API_KEY", // специфичная для Gemini
+			"CHAT_LLM_LLM_API_KEY",    // универсальная
+		}
+	default:
+		return []string{
+			"CHAT_LLM_LLM_API_KEY",
+		}
+	}
 }

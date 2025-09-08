@@ -35,9 +35,10 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting chat-llm-mvp server with context management",
+	logger.Info("Starting chat-llm-mvp server with provider support",
 		zap.String("host", cfg.Server.Host),
 		zap.Int("port", cfg.Server.Port),
+		zap.String("llm_provider", cfg.LLM.Provider),
 		zap.String("llm_model", cfg.LLM.Model),
 		zap.Int("context_window_size", cfg.Chat.ContextWindowSize),
 		zap.Int("max_messages_per_session", cfg.Chat.MaxMessagesPerSession),
@@ -45,7 +46,22 @@ func main() {
 
 	// Валидация конфигурации LLM
 	if cfg.LLM.APIKey == "" {
-		logger.Fatal("LLM API key is not set. Please set CHAT_LLM_LLM_API_KEY environment variable")
+		envVars := config.GetProviderSpecificEnvVars(cfg.LLM.Provider)
+		logger.Fatal("LLM API key is not set",
+			zap.String("provider", cfg.LLM.Provider),
+			zap.String("recommended", "Set api_key in config.yaml"),
+			zap.Strings("alternative_env_vars", envVars),
+		)
+	}
+
+	// Проверяем поддержку провайдера
+	if err := llm.ValidateProvider(cfg.LLM.Provider, logger); err != nil {
+		supportedProviders := llm.GetSupportedProviders(logger)
+		logger.Fatal("Unsupported LLM provider",
+			zap.String("provider", cfg.LLM.Provider),
+			zap.Strings("supported_providers", supportedProviders),
+			zap.Error(err),
+		)
 	}
 
 	// Инициализация storage
@@ -53,12 +69,27 @@ func main() {
 	logger.Info("Initialized in-memory storage")
 
 	// Инициализация LLM клиентов
-	mainLLMClient := initLLMClient(cfg, logger, "main")
-	shrinkLLMClient := initShrinkLLMClient(cfg, logger) // Отдельный клиент для сжатия
+	mainLLMClient, err := initLLMClient(cfg, logger, "main")
+	if err != nil {
+		logger.Fatal("Failed to initialize main LLM client", zap.Error(err))
+	}
+
+	shrinkLLMClient, err := initShrinkLLMClient(cfg, logger)
+	if err != nil {
+		logger.Fatal("Failed to initialize shrink LLM client", zap.Error(err))
+	}
 
 	logger.Info("Initialized LLM clients",
+		zap.String("main_provider", mainLLMClient.GetProviderName()),
 		zap.String("main_model", cfg.LLM.Model),
-		zap.String("shrink_model", "google/gemma-3-27b-it:free"), // Более дешевая модель для сжатия
+		zap.String("shrink_provider", shrinkLLMClient.GetProviderName()),
+	)
+
+	// Логируем поддерживаемые модели для текущего провайдера
+	supportedModels := mainLLMClient.GetSupportedModels()
+	logger.Info("Supported models for current provider",
+		zap.String("provider", cfg.LLM.Provider),
+		zap.Strings("models", supportedModels),
 	)
 
 	// Инициализация Summary Service
@@ -133,6 +164,9 @@ func main() {
 	// Тестовый запрос к LLM для проверки подключения
 	go testLLMConnection(mainLLMClient, logger)
 
+	// Логируем информацию о конфигурации
+	logConfigInfo(cfg, logger)
+
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -150,32 +184,51 @@ func main() {
 	logger.Info("Server stopped")
 }
 
-func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) llm.LLMClient {
+func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
 	llmConfig := llm.Config{
-		BaseURL: cfg.LLM.BaseURL,
-		APIKey:  cfg.LLM.APIKey,
-		Model:   cfg.LLM.Model,
-		Timeout: 60 * time.Second,
+		Provider: cfg.LLM.Provider,
+		BaseURL:  cfg.LLM.BaseURL,
+		APIKey:   cfg.LLM.APIKey,
+		Model:    cfg.LLM.Model,
+		Timeout:  60 * time.Second,
 	}
 
-	client := llm.NewClient(llmConfig, logger.With(zap.String("llm_client", clientType)))
-	return client
+	client, err := llm.NewClient(llmConfig, logger.With(zap.String("llm_client", clientType)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create %s LLM client: %w", clientType, err)
+	}
+
+	return client, nil
 }
 
-func initShrinkLLMClient(cfg *config.Config, logger *zap.Logger) llm.LLMClient {
-	// Используем более дешевую модель для сжатия
+func initShrinkLLMClient(cfg *config.Config, logger *zap.Logger) (*llm.Client, error) {
+	// Для сжатия используем более дешевый провайдер/модель если возможно
 	shrinkConfig := llm.Config{
-		BaseURL: cfg.LLM.BaseURL,
-		APIKey:  cfg.LLM.APIKey,
-		Model:   "google/gemma-3-27b-it:free", // Бесплатная модель для сжатия
-		Timeout: 45 * time.Second,             // Меньший таймаут для сжатия
+		Provider: cfg.LLM.Provider, // Используем тот же провайдер
+		BaseURL:  cfg.LLM.BaseURL,
+		APIKey:   cfg.LLM.APIKey,
+		Timeout:  45 * time.Second,
 	}
 
-	client := llm.NewClient(shrinkConfig, logger.With(zap.String("llm_client", "shrink")))
-	return client
+	// Выбираем модель для сжатия в зависимости от провайдера
+	switch cfg.LLM.Provider {
+	case "openrouter":
+		shrinkConfig.Model = "google/gemma-3-27b-it:free" // Бесплатная модель
+	case "gemini":
+		shrinkConfig.Model = "gemini-2.0-flash" // Быстрая модель Gemini
+	default:
+		shrinkConfig.Model = cfg.LLM.Model // Используем ту же модель
+	}
+
+	client, err := llm.NewClient(shrinkConfig, logger.With(zap.String("llm_client", "shrink")))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create shrink LLM client: %w", err)
+	}
+
+	return client, nil
 }
 
-func testLLMConnection(client llm.LLMClient, logger *zap.Logger) {
+func testLLMConnection(client *llm.Client, logger *zap.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -184,22 +237,47 @@ func testLLMConnection(client llm.LLMClient, logger *zap.Logger) {
 		{Role: "user", Content: "Hello! Just testing the connection. Please respond with 'OK'."},
 	}
 
-	logger.Info("Testing LLM connection...")
+	logger.Info("Testing LLM connection...",
+		zap.String("provider", client.GetProviderName()),
+	)
 
 	resp, err := client.ChatCompletion(ctx, testMessages)
 	if err != nil {
-		logger.Error("LLM connection test failed", zap.Error(err))
+		logger.Error("LLM connection test failed",
+			zap.String("provider", client.GetProviderName()),
+			zap.Error(err),
+		)
 		return
 	}
 
 	if len(resp.Choices) > 0 {
 		logger.Info("LLM connection test successful",
+			zap.String("provider", client.GetProviderName()),
 			zap.String("response", resp.Choices[0].Message.Content),
 			zap.Int("tokens_used", resp.Usage.TotalTokens),
 		)
 	} else {
-		logger.Warn("LLM connection test: no choices in response")
+		logger.Warn("LLM connection test: no choices in response",
+			zap.String("provider", client.GetProviderName()),
+		)
 	}
+}
+
+func logConfigInfo(cfg *config.Config, logger *zap.Logger) {
+	configSources := config.GetConfigSource(cfg)
+
+	logger.Info("Configuration loaded",
+		zap.String("config_file", configSources["config_file"]),
+		zap.String("api_key_source", configSources["api_key"]),
+		zap.String("provider", configSources["provider"]),
+	)
+
+	// Логируем рекомендуемые переменные окружения для текущего провайдера
+	envVars := config.GetProviderSpecificEnvVars(cfg.LLM.Provider)
+	logger.Info("Environment variables for current provider",
+		zap.String("provider", cfg.LLM.Provider),
+		zap.Strings("env_vars", envVars),
+	)
 }
 
 func setupLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
