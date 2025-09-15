@@ -36,29 +36,32 @@ type StreamChunk = providers.StreamChunk
 
 // Config конфигурация для клиента
 type Config struct {
-	Provider string        `mapstructure:"provider"` // новое поле
-	BaseURL  string        `mapstructure:"base_url"`
+	Provider string        `mapstructure:"provider"` // всегда "gemini"
 	APIKey   string        `mapstructure:"api_key"`
 	Model    string        `mapstructure:"model"`
 	Timeout  time.Duration `mapstructure:"timeout"`
 }
 
-// NewClient создает новый клиент с выбранным провайдером
+// NewClient создает новый клиент с MCP Gemini провайдером
 func NewClient(config Config, logger *zap.Logger) (*Client, error) {
+	// Проверяем, что провайдер - Gemini
+	if config.Provider != "gemini" {
+		return nil, fmt.Errorf("unsupported provider: %s (only 'gemini' is supported)", config.Provider)
+	}
+
 	// Конвертируем в конфиг провайдера
 	providerConfig := providers.Config{
 		Provider: config.Provider,
-		BaseURL:  config.BaseURL,
 		APIKey:   config.APIKey,
 		Model:    config.Model,
 		Timeout:  config.Timeout,
 	}
 
-	// Создаем фабрику и провайдер
+	// Создаем фабрику и провайдер (без MCP конфигурации - будет использоваться по умолчанию)
 	factory := providers.NewFactory(logger)
 	provider, err := factory.CreateProvider(providerConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create provider: %w", err)
+		return nil, fmt.Errorf("failed to create MCP Gemini provider: %w", err)
 	}
 
 	return &Client{
@@ -107,21 +110,13 @@ func (c *Client) GetSupportedModels() []string {
 
 // ValidateProvider проверяет, поддерживается ли провайдер
 func ValidateProvider(providerName string, logger *zap.Logger) error {
-	factory := providers.NewFactory(logger)
-	supportedProviders := factory.GetSupportedProviders()
-
-	for _, supported := range supportedProviders {
-		if supported == providerName {
-			return nil
-		}
+	if providerName != "gemini" {
+		return fmt.Errorf("unsupported provider '%s', only 'gemini' is supported", providerName)
 	}
-
-	return fmt.Errorf("unsupported provider '%s', supported providers: %v",
-		providerName, supportedProviders)
+	return nil
 }
 
 // GetSupportedProviders возвращает список всех поддерживаемых провайдеров
 func GetSupportedProviders(logger *zap.Logger) []string {
-	factory := providers.NewFactory(logger)
-	return factory.GetSupportedProviders()
+	return []string{"gemini"}
 }

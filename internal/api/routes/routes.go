@@ -1,4 +1,3 @@
-// internal/api/routes/routes.go
 package routes
 
 import (
@@ -36,7 +35,9 @@ func SetupRoutes(
 
 	// Добавляем информацию о текущем провайдере в контекст
 	r.Use(func(c *gin.Context) {
-		c.Set("current_provider", cfg.LLM.Provider)
+		c.Set("current_provider", "gemini")
+		c.Set("mcp_enabled", true)
+		c.Set("mcp_server_url", cfg.MCP.ServerURL)
 		c.Next()
 	})
 
@@ -72,11 +73,11 @@ func SetupRoutes(
 		// Models and Providers endpoints
 		models := api.Group("/models")
 		{
-			// Получение информации о всех доступных провайдерах и моделях
+			// Получение информации о доступных моделях
 			models.GET("", modelsHandler.GetAvailableModels)
 
-			// Получение моделей конкретного провайдера
-			models.GET("/:provider", modelsHandler.GetProviderModels)
+			// Получение моделей Gemini провайдера
+			models.GET("/gemini", modelsHandler.GetProviderModels)
 
 			// Валидация конфигурации провайдера
 			models.POST("/validate", modelsHandler.ValidateProviderConfig)
@@ -85,25 +86,58 @@ func SetupRoutes(
 		// Provider information endpoints
 		providers := api.Group("/providers")
 		{
-			// Получение списка всех поддерживаемых провайдеров
+			// Получение информации о поддерживаемых провайдерах
 			providers.GET("", func(c *gin.Context) {
-				// Возвращаем список поддерживаемых провайдеров
-				supportedProviders := []string{"openrouter", "gemini"}
-				currentProvider := cfg.LLM.Provider
-
 				c.JSON(200, gin.H{
-					"current":   currentProvider,
-					"supported": supportedProviders,
-					"default":   "openrouter",
+					"current":   "gemini",
+					"supported": []string{"gemini"},
+					"default":   "gemini",
+					"features": map[string]interface{}{
+						"mcp_enabled":   true,
+						"tool_calling":  true,
+						"multimodal":    true,
+						"large_context": true,
+					},
 				})
 			})
 
 			// Получение информации о текущем провайдере
 			providers.GET("/current", func(c *gin.Context) {
 				c.JSON(200, gin.H{
-					"provider": cfg.LLM.Provider,
-					"model":    cfg.LLM.Model,
-					"base_url": cfg.LLM.BaseURL,
+					"provider":    "gemini",
+					"model":       cfg.LLM.Model,
+					"description": "Google Gemini with MCP tool integration",
+					"mcp": gin.H{
+						"enabled":            true,
+						"server_url":         cfg.MCP.ServerURL,
+						"system_prompt_path": cfg.MCP.SystemPromptPath,
+						"max_iterations":     cfg.MCP.MaxIterations,
+					},
+				})
+			})
+		}
+
+		// MCP specific endpoints
+		mcp := api.Group("/mcp")
+		{
+			// Получение информации о MCP сервере
+			mcp.GET("/info", func(c *gin.Context) {
+				c.JSON(200, gin.H{
+					"enabled":            true,
+					"server_url":         cfg.MCP.ServerURL,
+					"system_prompt_path": cfg.MCP.SystemPromptPath,
+					"max_iterations":     cfg.MCP.MaxIterations,
+					"description":        "Model Context Protocol integration for enhanced AI capabilities",
+				})
+			})
+
+			// Проверка статуса MCP соединения
+			mcp.GET("/status", func(c *gin.Context) {
+				// Здесь можно добавить проверку доступности MCP сервера
+				c.JSON(200, gin.H{
+					"status":     "configured", // можно расширить до проверки связи
+					"server_url": cfg.MCP.ServerURL,
+					"message":    "MCP server is configured and ready",
 				})
 			})
 		}
@@ -125,10 +159,14 @@ func SetupRoutes(
 						"context_window_size":      cfg.Chat.ContextWindowSize,
 					},
 					"llm": gin.H{
-						"provider": cfg.LLM.Provider,
+						"provider": "gemini",
 						"model":    cfg.LLM.Model,
-						"base_url": cfg.LLM.BaseURL,
 						// НЕ включаем API ключ в ответ
+					},
+					"mcp": gin.H{
+						"server_url":         cfg.MCP.ServerURL,
+						"system_prompt_path": cfg.MCP.SystemPromptPath,
+						"max_iterations":     cfg.MCP.MaxIterations,
 					},
 					"sources": configSources,
 				})
@@ -136,16 +174,18 @@ func SetupRoutes(
 
 			// Получение рекомендуемых переменных окружения
 			configep.GET("/env-vars", func(c *gin.Context) {
-				provider := c.DefaultQuery("provider", cfg.LLM.Provider)
-				envVars := config.GetProviderSpecificEnvVars(provider)
+				geminiEnvVars := config.GetGeminiEnvVars()
+				mcpEnvVars := config.GetMCPEnvVars()
 
 				c.JSON(200, gin.H{
-					"provider": provider,
-					"env_vars": envVars,
-					"example": map[string]string{
-						"openrouter": "export CHAT_LLM_LLM_API_KEY=your_openrouter_key",
-						"gemini":     "export CHAT_LLM_GEMINI_API_KEY=your_gemini_key",
-					}[provider],
+					"provider":        "gemini",
+					"gemini_env_vars": geminiEnvVars,
+					"mcp_env_vars":    mcpEnvVars,
+					"examples": gin.H{
+						"gemini_api_key": "export CHAT_LLM_GEMINI_API_KEY=your_gemini_key",
+						"mcp_server":     "export CHAT_LLM_MCP_SERVER_URL=http://localhost:8000/mcp",
+						"system_prompt":  "export CHAT_LLM_MCP_SYSTEM_PROMPT_PATH=./system_prompt.txt",
+					},
 				})
 			})
 		}

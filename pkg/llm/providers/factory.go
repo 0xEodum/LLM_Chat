@@ -7,29 +7,47 @@ import (
 	"go.uber.org/zap"
 )
 
-type factory struct {
+type Factory struct {
 	logger *zap.Logger
 }
 
 func NewFactory(logger *zap.Logger) ProviderFactory {
-	return &factory{
+	return &Factory{
 		logger: logger,
 	}
 }
 
-func (f *factory) CreateProvider(config Config) (Provider, error) {
+func (f *Factory) CreateProvider(config Config) (Provider, error) {
 	provider := strings.ToLower(config.Provider)
 
 	switch provider {
-	case "openrouter":
-		return NewOpenRouterProvider(config, f.logger)
 	case "gemini":
-		return NewGeminiProvider(config, f.logger)
+		// Создаем MCP конфигурацию (должна передаваться извне)
+		// Это временное решение - в реальности конфигурация будет передаваться из main.go
+		mcpConfig := MCPProviderConfig{
+			ServerURL:        "http://localhost:8000/mcp", // будет переопределено
+			SystemPromptPath: "system_prompt.txt",         // будет переопределено
+			MaxIterations:    10,                          // будет переопределено
+			HTTPHeaders:      nil,
+		}
+		return NewMCPGeminiProvider(config, mcpConfig, f.logger)
 	default:
-		return nil, fmt.Errorf("unsupported provider: %s", config.Provider)
+		return nil, fmt.Errorf("unsupported provider: %s (only 'gemini' is supported)", config.Provider)
 	}
 }
 
-func (f *factory) GetSupportedProviders() []string {
-	return []string{"openrouter", "gemini"}
+func (f *Factory) GetSupportedProviders() []string {
+	return []string{"gemini"}
+}
+
+// CreateProviderWithMCP создает провайдер с MCP конфигурацией
+func (f *Factory) CreateProviderWithMCP(config Config, mcpConfig MCPProviderConfig) (Provider, error) {
+	provider := strings.ToLower(config.Provider)
+
+	switch provider {
+	case "gemini":
+		return NewMCPGeminiProvider(config, mcpConfig, f.logger)
+	default:
+		return nil, fmt.Errorf("unsupported provider: %s (only 'gemini' is supported)", config.Provider)
+	}
 }

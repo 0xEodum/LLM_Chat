@@ -17,6 +17,7 @@ import (
 	"LLM_Chat/internal/service/summary"
 	"LLM_Chat/internal/storage/memory"
 	"LLM_Chat/pkg/llm"
+	"LLM_Chat/pkg/llm/providers"
 
 	"go.uber.org/zap"
 )
@@ -35,32 +36,33 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting chat-llm-mvp server with provider support",
+	logger.Info("Starting chat-llm-mvp server with MCP Gemini support",
 		zap.String("host", cfg.Server.Host),
 		zap.Int("port", cfg.Server.Port),
 		zap.String("llm_provider", cfg.LLM.Provider),
 		zap.String("llm_model", cfg.LLM.Model),
+		zap.String("mcp_server", cfg.MCP.ServerURL),
+		zap.String("system_prompt_path", cfg.MCP.SystemPromptPath),
 		zap.Int("context_window_size", cfg.Chat.ContextWindowSize),
 		zap.Int("max_messages_per_session", cfg.Chat.MaxMessagesPerSession),
 	)
 
 	// Валидация конфигурации LLM
 	if cfg.LLM.APIKey == "" {
-		envVars := config.GetProviderSpecificEnvVars(cfg.LLM.Provider)
-		logger.Fatal("LLM API key is not set",
+		envVars := config.GetGeminiEnvVars()
+		logger.Fatal("Gemini API key is not set",
 			zap.String("provider", cfg.LLM.Provider),
 			zap.String("recommended", "Set api_key in config.yaml"),
 			zap.Strings("alternative_env_vars", envVars),
 		)
 	}
 
-	// Проверяем поддержку провайдера
-	if err := llm.ValidateProvider(cfg.LLM.Provider, logger); err != nil {
+	// Проверяем поддержку провайдера (теперь только Gemini)
+	if cfg.LLM.Provider != "gemini" {
 		supportedProviders := llm.GetSupportedProviders(logger)
 		logger.Fatal("Unsupported LLM provider",
 			zap.String("provider", cfg.LLM.Provider),
 			zap.Strings("supported_providers", supportedProviders),
-			zap.Error(err),
 		)
 	}
 
@@ -68,27 +70,27 @@ func main() {
 	storage := memory.New()
 	logger.Info("Initialized in-memory storage")
 
-	// Инициализация LLM клиентов
-	mainLLMClient, err := initLLMClient(cfg, logger, "main")
+	// Инициализация LLM клиентов с MCP поддержкой
+	mainLLMClient, err := initMCPLLMClient(cfg, logger, "main")
 	if err != nil {
 		logger.Fatal("Failed to initialize main LLM client", zap.Error(err))
 	}
 
-	shrinkLLMClient, err := initShrinkLLMClient(cfg, logger)
+	shrinkLLMClient, err := initMCPLLMClient(cfg, logger, "shrink")
 	if err != nil {
 		logger.Fatal("Failed to initialize shrink LLM client", zap.Error(err))
 	}
 
-	logger.Info("Initialized LLM clients",
+	logger.Info("Initialized MCP LLM clients",
 		zap.String("main_provider", mainLLMClient.GetProviderName()),
 		zap.String("main_model", cfg.LLM.Model),
 		zap.String("shrink_provider", shrinkLLMClient.GetProviderName()),
+		zap.String("mcp_server", cfg.MCP.ServerURL),
 	)
 
-	// Логируем поддерживаемые модели для текущего провайдера
+	// Логируем поддерживаемые модели
 	supportedModels := mainLLMClient.GetSupportedModels()
-	logger.Info("Supported models for current provider",
-		zap.String("provider", cfg.LLM.Provider),
+	logger.Info("Supported models for MCP Gemini provider",
 		zap.Strings("models", supportedModels),
 	)
 
@@ -161,9 +163,6 @@ func main() {
 		}
 	}()
 
-	// Тестовый запрос к LLM для проверки подключения
-	go testLLMConnection(mainLLMClient, logger)
-
 	// Логируем информацию о конфигурации
 	logConfigInfo(cfg, logger)
 
@@ -184,7 +183,7 @@ func main() {
 	logger.Info("Server stopped")
 }
 
-func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
+func initMCPLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
 	llmConfig := llm.Config{
 		Provider: cfg.LLM.Provider,
 		BaseURL:  cfg.LLM.BaseURL,
@@ -193,74 +192,23 @@ func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*
 		Timeout:  60 * time.Second,
 	}
 
-	client, err := llm.NewClient(llmConfig, logger.With(zap.String("llm_client", clientType)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create %s LLM client: %w", clientType, err)
+	// Создаем MCP конфигурацию
+	mcpConfig := providers.MCPProviderConfig{
+		ServerURL:        cfg.MCP.ServerURL,
+		SystemPromptPath: cfg.MCP.SystemPromptPath,
+		MaxIterations:    cfg.MCP.MaxIterations,
+		HTTPHeaders:      cfg.MCP.HTTPHeaders,
 	}
 
+	// Используем новую фабрику с MCP поддержкой
+	factory := providers.NewFactory(logger.With(zap.String("llm_client", clientType)))
+	provider, err := factory.CreateProviderWithMCP(llmConfig, mcpConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create %s MCP provider: %w", clientType, err)
+	}
+
+	client := llm.NewClientWithProvider(provider, logger.With(zap.String("llm_client", clientType)))
 	return client, nil
-}
-
-func initShrinkLLMClient(cfg *config.Config, logger *zap.Logger) (*llm.Client, error) {
-	// Для сжатия используем более дешевый провайдер/модель если возможно
-	shrinkConfig := llm.Config{
-		Provider: cfg.LLM.Provider, // Используем тот же провайдер
-		BaseURL:  cfg.LLM.BaseURL,
-		APIKey:   cfg.LLM.APIKey,
-		Timeout:  45 * time.Second,
-	}
-
-	// Выбираем модель для сжатия в зависимости от провайдера
-	switch cfg.LLM.Provider {
-	case "openrouter":
-		shrinkConfig.Model = "google/gemma-3-27b-it:free" // Бесплатная модель
-	case "gemini":
-		shrinkConfig.Model = "gemini-2.0-flash" // Быстрая модель Gemini
-	default:
-		shrinkConfig.Model = cfg.LLM.Model // Используем ту же модель
-	}
-
-	client, err := llm.NewClient(shrinkConfig, logger.With(zap.String("llm_client", "shrink")))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create shrink LLM client: %w", err)
-	}
-
-	return client, nil
-}
-
-func testLLMConnection(client *llm.Client, logger *zap.Logger) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Небольшой тестовый запрос
-	testMessages := []llm.Message{
-		{Role: "user", Content: "Hello! Just testing the connection. Please respond with 'OK'."},
-	}
-
-	logger.Info("Testing LLM connection...",
-		zap.String("provider", client.GetProviderName()),
-	)
-
-	resp, err := client.ChatCompletion(ctx, testMessages)
-	if err != nil {
-		logger.Error("LLM connection test failed",
-			zap.String("provider", client.GetProviderName()),
-			zap.Error(err),
-		)
-		return
-	}
-
-	if len(resp.Choices) > 0 {
-		logger.Info("LLM connection test successful",
-			zap.String("provider", client.GetProviderName()),
-			zap.String("response", resp.Choices[0].Message.Content),
-			zap.Int("tokens_used", resp.Usage.TotalTokens),
-		)
-	} else {
-		logger.Warn("LLM connection test: no choices in response",
-			zap.String("provider", client.GetProviderName()),
-		)
-	}
 }
 
 func logConfigInfo(cfg *config.Config, logger *zap.Logger) {
@@ -270,13 +218,20 @@ func logConfigInfo(cfg *config.Config, logger *zap.Logger) {
 		zap.String("config_file", configSources["config_file"]),
 		zap.String("api_key_source", configSources["api_key"]),
 		zap.String("provider", configSources["provider"]),
+		zap.String("mcp_server", configSources["mcp_server"]),
+		zap.String("system_prompt", configSources["system_prompt"]),
 	)
 
-	// Логируем рекомендуемые переменные окружения для текущего провайдера
-	envVars := config.GetProviderSpecificEnvVars(cfg.LLM.Provider)
-	logger.Info("Environment variables for current provider",
-		zap.String("provider", cfg.LLM.Provider),
-		zap.Strings("env_vars", envVars),
+	// Логируем рекомендуемые переменные окружения
+	geminiEnvVars := config.GetGeminiEnvVars()
+	mcpEnvVars := config.GetMCPEnvVars()
+
+	logger.Info("Environment variables for Gemini",
+		zap.Strings("gemini_env_vars", geminiEnvVars),
+	)
+
+	logger.Info("Environment variables for MCP",
+		zap.Strings("mcp_env_vars", mcpEnvVars),
 	)
 }
 

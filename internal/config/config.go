@@ -13,6 +13,7 @@ type Config struct {
 	Logging LoggingConfig `mapstructure:"logging"`
 	Chat    ChatConfig    `mapstructure:"chat"`
 	LLM     LLMConfig     `mapstructure:"llm"`
+	MCP     MCPConfig     `mapstructure:"mcp"`
 }
 
 type ServerConfig struct {
@@ -33,10 +34,17 @@ type ChatConfig struct {
 }
 
 type LLMConfig struct {
-	Provider string `mapstructure:"provider"` // новое поле: "openrouter", "gemini"
-	BaseURL  string `mapstructure:"base_url"`
-	Model    string `mapstructure:"model"`
+	Provider string `mapstructure:"provider"` // всегда "gemini" (MCP)
+	BaseURL  string `mapstructure:"base_url"` // ← ДОБАВИТЬ ЭТО ПОЛЕ
 	APIKey   string `mapstructure:"api_key"`
+	Model    string `mapstructure:"model"`
+}
+
+type MCPConfig struct {
+	ServerURL        string            `mapstructure:"server_url"`
+	HTTPHeaders      map[string]string `mapstructure:"http_headers"`
+	SystemPromptPath string            `mapstructure:"system_prompt_path"`
+	MaxIterations    int               `mapstructure:"max_iterations"`
 }
 
 func Load() (*Config, error) {
@@ -61,9 +69,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// Обработка API ключей для разных провайдеров
+	// Обработка API ключа для Gemini
 	if strings.TrimSpace(config.LLM.APIKey) == "" {
-		config.LLM.APIKey = getAPIKeyForProvider(config.LLM.Provider)
+		config.LLM.APIKey = getGeminiAPIKey()
 	}
 
 	// Валидация критических параметров
@@ -89,57 +97,43 @@ func setDefaults() {
 	viper.SetDefault("chat.max_messages_per_session", 50)
 	viper.SetDefault("chat.context_window_size", 20)
 
-	// LLM defaults
-	viper.SetDefault("llm.provider", "openrouter")
-	viper.SetDefault("llm.base_url", "https://openrouter.ai/api/v1")
-	viper.SetDefault("llm.model", "google/gemma-3-27b-it:free")
+	// LLM defaults (только Gemini MCP)
+	viper.SetDefault("llm.provider", "gemini")
+	viper.SetDefault("llm.model", "gemini-2.5-flash")
+
+	// MCP defaults
+	viper.SetDefault("mcp.server_url", "http://localhost:8000/mcp")
+	viper.SetDefault("mcp.system_prompt_path", "system_prompt.txt")
+	viper.SetDefault("mcp.max_iterations", 10)
 }
 
-func getAPIKeyForProvider(provider string) string {
-	switch strings.ToLower(provider) {
-	case "openrouter":
-		return viper.GetString("LLM_API_KEY") // CHAT_LLM_LLM_API_KEY
-	case "gemini":
-		// Пробуем специфичные переменные для Gemini
-		if key := viper.GetString("GEMINI_API_KEY"); key != "" {
-			return key
-		}
-		return viper.GetString("LLM_API_KEY") // fallback
-	default:
-		return viper.GetString("LLM_API_KEY")
+func getGeminiAPIKey() string {
+	// Пробуем специфичные переменные для Gemini
+	if key := viper.GetString("GEMINI_API_KEY"); key != "" {
+		return key
 	}
+	return viper.GetString("LLM_API_KEY") // fallback
 }
 
 func validateConfig(config *Config) error {
-	// Проверяем провайдер
-	supportedProviders := []string{"openrouter", "gemini"}
-	providerValid := false
-	for _, supported := range supportedProviders {
-		if strings.ToLower(config.LLM.Provider) == supported {
-			providerValid = true
-			break
-		}
-	}
-	if !providerValid {
-		return fmt.Errorf("unsupported LLM provider: %s, supported: %v",
-			config.LLM.Provider, supportedProviders)
+	// Проверяем провайдер (должен быть только gemini)
+	if strings.ToLower(config.LLM.Provider) != "gemini" {
+		return fmt.Errorf("unsupported LLM provider: %s, only 'gemini' is supported", config.LLM.Provider)
 	}
 
 	// Проверяем наличие API ключа
 	if strings.TrimSpace(config.LLM.APIKey) == "" {
-		return fmt.Errorf(`LLM API key is required. 
+		return fmt.Errorf(`Gemini API key is required. 
 
 Рекомендуемый способ - укажите ключ в config.yaml:
 llm:
-  provider: "%s"
-  api_key: "your_api_key_here"
+  api_key: "your_gemini_api_key_here"
 
 Альтернативно, используйте переменную окружения: %s`,
-			config.LLM.Provider,
-			strings.Join(GetProviderSpecificEnvVars(config.LLM.Provider), " или "))
+			strings.Join(GetGeminiEnvVars(), " или "))
 	}
 
-	// Проверяем базовые параметры
+	// Проверяем базовые параметры сервера
 	if config.Server.Port <= 0 || config.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", config.Server.Port)
 	}
@@ -152,39 +146,23 @@ llm:
 		return fmt.Errorf("max messages per session must be positive: %d", config.Chat.MaxMessagesPerSession)
 	}
 
-	if strings.TrimSpace(config.LLM.BaseURL) == "" {
-		return fmt.Errorf("LLM base URL is required")
-	}
-
 	if strings.TrimSpace(config.LLM.Model) == "" {
 		return fmt.Errorf("LLM model is required")
 	}
 
-	// Валидация специфичная для провайдеров
-	if err := validateProviderSpecific(config); err != nil {
-		return err
+	// Проверяем MCP конфигурацию
+	if strings.TrimSpace(config.MCP.ServerURL) == "" {
+		return fmt.Errorf("MCP server URL is required")
 	}
 
-	return nil
-}
-
-func validateProviderSpecific(config *Config) error {
-	switch strings.ToLower(config.LLM.Provider) {
-	case "openrouter":
-		// Для OpenRouter проверяем, что URL правильный
-		if !strings.Contains(config.LLM.BaseURL, "openrouter") {
-			return fmt.Errorf("base URL should contain 'openrouter' for OpenRouter provider")
-		}
-	case "gemini":
-		// Для Gemini проверяем, что URL содержит правильный эндпоинт
-		if !strings.Contains(config.LLM.BaseURL, "google") && !strings.Contains(config.LLM.BaseURL, "gemini") {
-			return fmt.Errorf("base URL should contain 'google' or 'gemini' for Gemini provider")
-		}
-		// Проверяем модель
-		if !strings.Contains(config.LLM.Model, "gemini") {
-			return fmt.Errorf("model should contain 'gemini' for Gemini provider")
-		}
+	if strings.TrimSpace(config.MCP.SystemPromptPath) == "" {
+		return fmt.Errorf("MCP system prompt path is required")
 	}
+
+	if config.MCP.MaxIterations <= 0 {
+		return fmt.Errorf("MCP max iterations must be positive: %d", config.MCP.MaxIterations)
+	}
+
 	return nil
 }
 
@@ -194,19 +172,14 @@ func GetConfigSource(config *Config) map[string]string {
 
 	// Проверяем, откуда взят API ключ
 	viperAPIKey := viper.GetString("llm.api_key")
-	envAPIKey := getAPIKeyForProvider(config.LLM.Provider)
+	envAPIKey := getGeminiAPIKey()
 
 	if viperAPIKey != "" {
 		sources["api_key"] = "config.yaml"
 	} else if envAPIKey != "" {
-		switch strings.ToLower(config.LLM.Provider) {
-		case "gemini":
-			if viper.GetString("GEMINI_API_KEY") != "" {
-				sources["api_key"] = "environment variable CHAT_LLM_GEMINI_API_KEY"
-			} else {
-				sources["api_key"] = "environment variable CHAT_LLM_LLM_API_KEY"
-			}
-		default:
+		if viper.GetString("GEMINI_API_KEY") != "" {
+			sources["api_key"] = "environment variable CHAT_LLM_GEMINI_API_KEY"
+		} else {
 			sources["api_key"] = "environment variable CHAT_LLM_LLM_API_KEY"
 		}
 	} else {
@@ -214,26 +187,26 @@ func GetConfigSource(config *Config) map[string]string {
 	}
 
 	sources["config_file"] = viper.ConfigFileUsed()
-	sources["provider"] = config.LLM.Provider
+	sources["provider"] = "gemini (MCP)"
+	sources["mcp_server"] = config.MCP.ServerURL
+	sources["system_prompt"] = config.MCP.SystemPromptPath
 
 	return sources
 }
 
-// GetProviderSpecificEnvVars возвращает рекомендуемые переменные окружения для провайдера
-func GetProviderSpecificEnvVars(provider string) []string {
-	switch strings.ToLower(provider) {
-	case "openrouter":
-		return []string{
-			"CHAT_LLM_LLM_API_KEY",
-		}
-	case "gemini":
-		return []string{
-			"CHAT_LLM_GEMINI_API_KEY", // специфичная для Gemini
-			"CHAT_LLM_LLM_API_KEY",    // универсальная
-		}
-	default:
-		return []string{
-			"CHAT_LLM_LLM_API_KEY",
-		}
+// GetGeminiEnvVars возвращает рекомендуемые переменные окружения для Gemini
+func GetGeminiEnvVars() []string {
+	return []string{
+		"CHAT_LLM_GEMINI_API_KEY",
+		"CHAT_LLM_LLM_API_KEY",
+	}
+}
+
+// GetMCPEnvVars возвращает переменные окружения для MCP
+func GetMCPEnvVars() []string {
+	return []string{
+		"CHAT_LLM_MCP_SERVER_URL",
+		"CHAT_LLM_MCP_SYSTEM_PROMPT_PATH",
+		"CHAT_LLM_MCP_MAX_ITERATIONS",
 	}
 }

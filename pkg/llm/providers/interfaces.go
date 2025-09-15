@@ -75,5 +75,6 @@ type Config struct {
 // ProviderFactory создает провайдеров
 type ProviderFactory interface {
 	CreateProvider(config Config) (Provider, error)
+	CreateProviderWithMCP(config Config, mcpConfig MCPProviderConfig) (Provider, error) // <-- добавить эту строку
 	GetSupportedProviders() []string
 }
