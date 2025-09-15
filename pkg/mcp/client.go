@@ -142,20 +142,18 @@ func ConvertMCPToGeminiTools(tools []*sdkmcp.Tool) []*genai.FunctionDeclaration 
 	for _, t := range tools {
 		var root jsonschema.Schema
 		if t.InputSchema != nil {
-			if s, err := jsonschema.UnmarshalJSONSchema(t.InputSchema); err == nil && s != nil {
-				root = *s
-			}
+			root = *t.InputSchema
 		}
 		if strings.ToLower(strings.TrimSpace(root.Type)) != "object" {
 			root.Type = "object"
 		}
 		params := convertProperty(&root)
 		out = append(out, &genai.FunctionDeclaration{
-			Name:   t.Name,
-			Params: params,
+			Name:       t.Name,
+			Parameters: params,
 			Description: firstNonEmpty(
 				t.Description,
-				t.PrettyName,
+				t.Title,
 			),
 		})
 	}
