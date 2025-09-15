@@ -35,7 +35,7 @@ type MCPGeminiProvider struct {
 	maxIterations    int
 	httpHeaders      map[string]string
 	geminiAPIKey     string
-	geminiBaseURL    string // ← ДОБАВИТЬ ЭТО ПОЛЕ
+	geminiBaseURL    string
 	geminiModel      string
 	systemPrompt     string
 

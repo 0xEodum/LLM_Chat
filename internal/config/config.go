@@ -159,6 +159,12 @@ llm:
 		return fmt.Errorf("MCP system prompt path is required")
 	}
 
+	if strings.TrimSpace(config.LLM.BaseURL) != "" {
+		if !strings.HasPrefix(config.LLM.BaseURL, "http") {
+			return fmt.Errorf("LLM base_url must start with http:// or https://")
+		}
+	}
+
 	if config.MCP.MaxIterations <= 0 {
 		return fmt.Errorf("MCP max iterations must be positive: %d", config.MCP.MaxIterations)
 	}

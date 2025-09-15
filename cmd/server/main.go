@@ -186,7 +186,7 @@ func main() {
 func initMCPLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
 	llmConfig := llm.Config{
 		Provider: cfg.LLM.Provider,
-		BaseURL:  cfg.LLM.BaseURL,
+		BaseURL:  cfg.LLM.BaseURL, // ДОБАВИТЬ эту строку
 		APIKey:   cfg.LLM.APIKey,
 		Model:    cfg.LLM.Model,
 		Timeout:  60 * time.Second,
@@ -201,8 +201,17 @@ func initMCPLLMClient(cfg *config.Config, logger *zap.Logger, clientType string)
 	}
 
 	// Используем новую фабрику с MCP поддержкой
+	providerConfig := providers.Config{
+		Provider: llmConfig.Provider,
+		BaseURL:  llmConfig.BaseURL,
+		APIKey:   llmConfig.APIKey,
+		Model:    llmConfig.Model,
+		Timeout:  llmConfig.Timeout,
+	}
+
+	// Используем новую фабрику с MCP поддержкой
 	factory := providers.NewFactory(logger.With(zap.String("llm_client", clientType)))
-	provider, err := factory.CreateProviderWithMCP(llmConfig, mcpConfig)
+	provider, err := factory.CreateProviderWithMCP(providerConfig, mcpConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s MCP provider: %w", clientType, err)
 	}

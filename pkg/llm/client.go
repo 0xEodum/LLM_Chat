@@ -40,6 +40,7 @@ type Config struct {
 	APIKey   string        `mapstructure:"api_key"`
 	Model    string        `mapstructure:"model"`
 	Timeout  time.Duration `mapstructure:"timeout"`
+	BaseURL  string        `mapstructure:"base_url"`
 }
 
 // NewClient создает новый клиент с MCP Gemini провайдером
