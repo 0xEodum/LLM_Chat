@@ -1,0 +1,20 @@
+server:
+  host: localhost
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 30s
+logging:
+  level: info
+  format: json
+chat:
+  max_messages_per_session: 50
+  context_window_size: 20
+llm:
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  model: google/gemma-3-27b-it:free
+  api_key: YOUR_API_KEY
+  server_url: http://localhost:8000/mcp
+  system_prompt_path: system_prompt.txt
+  http_headers:
+    X-Custom-Header: value

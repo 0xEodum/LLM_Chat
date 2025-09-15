@@ -126,14 +126,16 @@ func main() {
 	)
 
 	// Инициализация Chat Service с Context Manager
-	chatService := chat.NewService(
+	chatService, err := chat.NewService(
 		storage,        // MessageStore
 		storage,        // SessionStore
 		contextManager, // ContextManager
-		mainLLMClient,  // Main LLM
-		&cfg.Chat,
+		cfg,
 		logger,
 	)
+	if err != nil {
+		logger.Fatal("Failed to initialize chat service", zap.Error(err))
+	}
 	logger.Info("Initialized chat service with context management")
 
 	// Инициализация handlers
@@ -186,11 +188,14 @@ func main() {
 
 func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
 	llmConfig := llm.Config{
-		Provider: cfg.LLM.Provider,
-		BaseURL:  cfg.LLM.BaseURL,
-		APIKey:   cfg.LLM.APIKey,
-		Model:    cfg.LLM.Model,
-		Timeout:  60 * time.Second,
+		Provider:         cfg.LLM.Provider,
+		BaseURL:          cfg.LLM.BaseURL,
+		APIKey:           cfg.LLM.APIKey,
+		Model:            cfg.LLM.Model,
+		Timeout:          60 * time.Second,
+		ServerURL:        cfg.LLM.ServerURL,
+		HTTPHeaders:      cfg.LLM.HTTPHeaders,
+		SystemPromptPath: cfg.LLM.SystemPromptPath,
 	}
 
 	client, err := llm.NewClient(llmConfig, logger.With(zap.String("llm_client", clientType)))
@@ -204,10 +209,13 @@ func initLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*
 func initShrinkLLMClient(cfg *config.Config, logger *zap.Logger) (*llm.Client, error) {
 	// Для сжатия используем более дешевый провайдер/модель если возможно
 	shrinkConfig := llm.Config{
-		Provider: cfg.LLM.Provider, // Используем тот же провайдер
-		BaseURL:  cfg.LLM.BaseURL,
-		APIKey:   cfg.LLM.APIKey,
-		Timeout:  45 * time.Second,
+		Provider:         cfg.LLM.Provider, // Используем тот же провайдер
+		BaseURL:          cfg.LLM.BaseURL,
+		APIKey:           cfg.LLM.APIKey,
+		Timeout:          45 * time.Second,
+		ServerURL:        cfg.LLM.ServerURL,
+		HTTPHeaders:      cfg.LLM.HTTPHeaders,
+		SystemPromptPath: cfg.LLM.SystemPromptPath,
 	}
 
 	// Выбираем модель для сжатия в зависимости от провайдера

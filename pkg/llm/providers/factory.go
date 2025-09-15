@@ -25,11 +25,13 @@ func (f *factory) CreateProvider(config Config) (Provider, error) {
 		return NewOpenRouterProvider(config, f.logger)
 	case "gemini":
 		return NewGeminiProvider(config, f.logger)
+	case "gemini-mcp":
+		return NewGeminiMCPProvider(config, f.logger)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", config.Provider)
 	}
 }
 
 func (f *factory) GetSupportedProviders() []string {
-	return []string{"openrouter", "gemini"}
+	return []string{"openrouter", "gemini", "gemini-mcp"}
 }

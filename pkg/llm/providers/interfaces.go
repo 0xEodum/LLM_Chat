@@ -65,11 +65,14 @@ type Provider interface {
 
 // Config общая конфигурация для всех провайдеров
 type Config struct {
-	Provider string        `mapstructure:"provider"` // "openrouter", "gemini", etc.
-	BaseURL  string        `mapstructure:"base_url"`
-	APIKey   string        `mapstructure:"api_key"`
-	Model    string        `mapstructure:"model"`
-	Timeout  time.Duration `mapstructure:"timeout"`
+	Provider         string            `mapstructure:"provider"` // "openrouter", "gemini", etc.
+	BaseURL          string            `mapstructure:"base_url"`
+	APIKey           string            `mapstructure:"api_key"`
+	Model            string            `mapstructure:"model"`
+	Timeout          time.Duration     `mapstructure:"timeout"`
+	ServerURL        string            `mapstructure:"server_url"`
+	HTTPHeaders      map[string]string `mapstructure:"http_headers"`
+	SystemPromptPath string            `mapstructure:"system_prompt_path"`
 }
 
 // ProviderFactory создает провайдеров
