@@ -36,22 +36,28 @@ type StreamChunk = providers.StreamChunk
 
 // Config конфигурация для клиента
 type Config struct {
-	Provider string        `mapstructure:"provider"` // новое поле
-	BaseURL  string        `mapstructure:"base_url"`
-	APIKey   string        `mapstructure:"api_key"`
-	Model    string        `mapstructure:"model"`
-	Timeout  time.Duration `mapstructure:"timeout"`
+	Provider         string            `mapstructure:"provider"` // новое поле
+	BaseURL          string            `mapstructure:"base_url"`
+	APIKey           string            `mapstructure:"api_key"`
+	Model            string            `mapstructure:"model"`
+	Timeout          time.Duration     `mapstructure:"timeout"`
+	ServerURL        string            `mapstructure:"server_url"`
+	HTTPHeaders      map[string]string `mapstructure:"http_headers"`
+	SystemPromptPath string            `mapstructure:"system_prompt_path"`
 }
 
 // NewClient создает новый клиент с выбранным провайдером
 func NewClient(config Config, logger *zap.Logger) (*Client, error) {
 	// Конвертируем в конфиг провайдера
 	providerConfig := providers.Config{
-		Provider: config.Provider,
-		BaseURL:  config.BaseURL,
-		APIKey:   config.APIKey,
-		Model:    config.Model,
-		Timeout:  config.Timeout,
+		Provider:         config.Provider,
+		BaseURL:          config.BaseURL,
+		APIKey:           config.APIKey,
+		Model:            config.Model,
+		Timeout:          config.Timeout,
+		ServerURL:        config.ServerURL,
+		HTTPHeaders:      config.HTTPHeaders,
+		SystemPromptPath: config.SystemPromptPath,
 	}
 
 	// Создаем фабрику и провайдер

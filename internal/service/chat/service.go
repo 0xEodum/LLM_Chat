@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -23,24 +24,46 @@ type Service struct {
 	llmClient      llm.LLMClient
 	config         *config.ChatConfig
 	logger         *zap.Logger
+	systemPrompt   string
 }
 
 func NewService(
 	messageStore interfaces.MessageStore,
 	sessionStore interfaces.SessionStore,
 	contextManager contextmgr.ContextManager,
-	llmClient llm.LLMClient,
-	config *config.ChatConfig,
+	cfg *config.Config,
 	logger *zap.Logger,
-) *Service {
+) (*Service, error) {
+	llmCfg := llm.Config{
+		Provider:         cfg.LLM.Provider,
+		BaseURL:          cfg.LLM.BaseURL,
+		APIKey:           cfg.LLM.APIKey,
+		Model:            cfg.LLM.Model,
+		Timeout:          60 * time.Second,
+		ServerURL:        cfg.LLM.ServerURL,
+		HTTPHeaders:      cfg.LLM.HTTPHeaders,
+		SystemPromptPath: cfg.LLM.SystemPromptPath,
+	}
+
+	llmClient, err := llm.NewClient(llmCfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create LLM client: %w", err)
+	}
+
+	promptBytes, err := os.ReadFile(cfg.LLM.SystemPromptPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read system prompt: %w", err)
+	}
+
 	return &Service{
 		messageStore:   messageStore,
 		sessionStore:   sessionStore,
 		contextManager: contextManager,
 		llmClient:      llmClient,
-		config:         config,
+		config:         &cfg.Chat,
 		logger:         logger,
-	}
+		systemPrompt:   string(promptBytes),
+	}, nil
 }
 
 type ProcessMessageRequest struct {
@@ -418,11 +441,7 @@ type CompressionResult struct {
 }
 
 func (s *Service) getSystemPrompt() string {
-	return `Ты полезный AI-ассистент. Отвечай на русском языке, если пользователь пишет на русском. 
-Будь вежливым, информативным и помогай пользователю решать его задачи.
-Если не знаешь ответа, честно скажи об этом.
-
-Если в контексте есть резюме предыдущего разговора, учитывай его при формировании ответов, но не упоминай явно, что ты читаешь резюме.`
+	return s.systemPrompt
 }
 
 func (s *Service) ensureSession(ctx context.Context, sessionID string) error {
