@@ -248,11 +248,9 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 		return nil, fmt.Errorf("initialization failed: %w", err)
 	}
 
-	// ВАЖНО: SystemInstruction — вместо конкатенации системного промпта в текст
 	p.model.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(p.systemPrompt)}}
 	p.model.Tools = []*genai.Tool{{FunctionDeclarations: p.geminiTools}}
 
-	// Готовим историю и последний user-вопрос
 	history, lastUser := p.toGenaiHistory(messages)
 
 	chat := p.model.StartChat()
@@ -261,7 +259,6 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 	var finalAnswer string
 	var totalTokens int
 
-	// Первая генерация — с последним user-сообщением
 	resp, err := chat.SendMessage(ctx, lastUser.Parts...)
 	if err != nil {
 		return nil, fmt.Errorf("Gemini generate error: %w", err)
@@ -280,7 +277,6 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 		cand := resp.Candidates[0]
 		fcalls := cand.FunctionCalls()
 
-		// Если модель просит вызвать инструменты
 		if len(fcalls) > 0 {
 			for _, fc := range fcalls {
 				args := fc.Args
@@ -292,7 +288,6 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 					result = map[string]any{"error": err.Error()}
 				}
 
-				// Возвращаем результат инструмента в историю
 				chat.History = append(chat.History, &genai.Content{
 					Role: "tool",
 					Parts: []genai.Part{
@@ -304,7 +299,6 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 				})
 			}
 
-			// Просим модель продолжить с учётом ToolResponse
 			resp, err = chat.SendMessage(ctx, genai.Text(""))
 			if err != nil {
 				return nil, fmt.Errorf("Gemini generate error (after tool): %w", err)
@@ -348,7 +342,7 @@ func (p *MCPGeminiProvider) ChatCompletion(ctx context.Context, messages []Messa
 			},
 		},
 		Usage: Usage{
-			PromptTokens:     0, // Можно разложить totalTokens на prompt/completion, если нужно
+			PromptTokens:     0,
 			CompletionTokens: 0,
 			TotalTokens:      totalTokens,
 		},

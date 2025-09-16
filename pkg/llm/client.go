@@ -1,11 +1,9 @@
 package llm
 
 import (
+	"LLM_Chat/pkg/llm/providers"
 	"context"
 	"fmt"
-	"time"
-
-	"LLM_Chat/pkg/llm/providers"
 
 	"go.uber.org/zap"
 )
@@ -33,43 +31,6 @@ type Usage = providers.Usage
 
 // StreamChunk совместимый тип
 type StreamChunk = providers.StreamChunk
-
-// Config конфигурация для клиента
-type Config struct {
-	Provider string        `mapstructure:"provider"` // всегда "gemini"
-	APIKey   string        `mapstructure:"api_key"`
-	Model    string        `mapstructure:"model"`
-	Timeout  time.Duration `mapstructure:"timeout"`
-	BaseURL  string        `mapstructure:"base_url"`
-}
-
-// NewClient создает новый клиент с MCP Gemini провайдером
-func NewClient(config Config, logger *zap.Logger) (*Client, error) {
-	// Проверяем, что провайдер - Gemini
-	if config.Provider != "gemini" {
-		return nil, fmt.Errorf("unsupported provider: %s (only 'gemini' is supported)", config.Provider)
-	}
-
-	// Конвертируем в конфиг провайдера
-	providerConfig := providers.Config{
-		Provider: config.Provider,
-		APIKey:   config.APIKey,
-		Model:    config.Model,
-		Timeout:  config.Timeout,
-	}
-
-	// Создаем фабрику и провайдер (без MCP конфигурации - будет использоваться по умолчанию)
-	factory := providers.NewFactory(logger)
-	provider, err := factory.CreateProvider(providerConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MCP Gemini provider: %w", err)
-	}
-
-	return &Client{
-		provider: provider,
-		logger:   logger,
-	}, nil
-}
 
 // NewClientWithProvider создает клиент с готовым провайдером
 func NewClientWithProvider(provider providers.Provider, logger *zap.Logger) *Client {

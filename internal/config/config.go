@@ -1,6 +1,7 @@
 package config
 
 import (
+	"LLM_Chat/pkg/llm/providers"
 	"fmt"
 	"strings"
 	"time"
@@ -45,6 +46,26 @@ type MCPConfig struct {
 	HTTPHeaders      map[string]string `mapstructure:"http_headers"`
 	SystemPromptPath string            `mapstructure:"system_prompt_path"`
 	MaxIterations    int               `mapstructure:"max_iterations"`
+}
+
+func (cfg *Config) ToProviderConfig() providers.Config {
+	return providers.Config{
+		Provider: cfg.LLM.Provider,
+		BaseURL:  cfg.LLM.BaseURL,
+		APIKey:   cfg.LLM.APIKey,
+		Model:    cfg.LLM.Model,
+		Timeout:  60 * time.Second, // или cfg.LLM.Timeout если добавить
+	}
+}
+
+// ToMCPConfig создает MCP конфигурацию
+func (cfg *Config) ToMCPConfig() providers.MCPProviderConfig {
+	return providers.MCPProviderConfig{
+		ServerURL:        cfg.MCP.ServerURL,
+		SystemPromptPath: cfg.MCP.SystemPromptPath,
+		MaxIterations:    cfg.MCP.MaxIterations,
+		HTTPHeaders:      cfg.MCP.HTTPHeaders,
+	}
 }
 
 func Load() (*Config, error) {
