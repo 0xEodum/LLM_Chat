@@ -10,6 +10,7 @@ import (
 	"LLM_Chat/internal/storage/models"
 	"LLM_Chat/pkg/llm"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -21,7 +22,7 @@ type Service struct {
 }
 
 type Config struct {
-	MaxMessagesBeforeSummary int // Максимум сообщений до сжатия
+	MaxMessagesBeforeSummary int // Максимум сообщений до сжатия (deprecated, используется в Context Manager)
 	ContextWindowSize        int // Размер окна контекста
 	AnchorsCount             int // Количество якорей для создания
 	SummaryMaxLength         int // Максимальная длина резюме
@@ -30,11 +31,11 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		MaxMessagesBeforeSummary: 50,
+		MaxMessagesBeforeSummary: 50, // Deprecated
 		ContextWindowSize:        20,
 		AnchorsCount:             5,
 		SummaryMaxLength:         500,
-		MinMessagesForSummary:    10,
+		MinMessagesForSummary:    3, // Минимум для работы с многоуровневым сжатием
 	}
 }
 
@@ -53,50 +54,33 @@ func NewService(
 }
 
 type SummaryRequest struct {
-	SessionID string
-	Messages  []models.Message
-	Reason    string // Причина создания резюме
+	SessionID    string
+	Messages     []models.Message
+	Reason       string // Причина создания резюме
+	SummaryLevel int    // 1 = regular summary, 2 = bulk summary
 }
 
 type SummaryResponse struct {
-	SessionID    string
-	Anchors      []string
-	BriefSummary string
-	TokensUsed   int
-	Compressed   int // Количество сжатых сообщений
+	SessionID           string
+	SummaryID           string // ID созданного резюме
+	Anchors             []string
+	BriefSummary        string
+	SummaryLevel        int
+	TokensUsed          int
+	MessagesCompressed  int // Количество сжатых сообщений
+	SummariesCompressed int // Количество сжатых резюме (для bulk summaries)
+	Duration            time.Duration
 }
 
-// ShouldCreateSummary определяет, нужно ли создавать резюме
-func (s *Service) ShouldCreateSummary(ctx context.Context, sessionID string, messageCount int) (bool, string) {
-	// Проверяем текущее резюме
-	summary, err := s.summaryStore.GetSummary(ctx, sessionID)
-	if err != nil {
-		// Нет резюме, проверяем по общему количеству
-		if messageCount >= s.config.MaxMessagesBeforeSummary {
-			return true, "initial_summary"
-		}
-		return false, ""
-	}
-
-	// Есть резюме, проверяем новые сообщения с момента последнего обновления
-	// TODO: Более точная логика на основе времени последнего обновления
-	timeSinceUpdate := time.Since(summary.UpdatedAt)
-
-	if messageCount >= s.config.MaxMessagesBeforeSummary && timeSinceUpdate > 10*time.Minute {
-		return true, "update_summary"
-	}
-
-	return false, ""
-}
-
-// CreateSummary создаёт резюме и якоря для сессии
+// CreateSummary создаёт резюме указанного уровня
 func (s *Service) CreateSummary(ctx context.Context, req SummaryRequest) (*SummaryResponse, error) {
 	startTime := time.Now()
 
-	s.logger.Info("Creating summary",
+	s.logger.Info("Creating multi-level summary",
 		zap.String("session_id", req.SessionID),
 		zap.Int("messages_count", len(req.Messages)),
 		zap.String("reason", req.Reason),
+		zap.Int("summary_level", req.SummaryLevel),
 	)
 
 	if len(req.Messages) < s.config.MinMessagesForSummary {
@@ -104,24 +88,43 @@ func (s *Service) CreateSummary(ctx context.Context, req SummaryRequest) (*Summa
 			len(req.Messages), s.config.MinMessagesForSummary)
 	}
 
-	// 1. Создаём якоря (ключевые моменты разговора)
-	anchors, err := s.createAnchors(ctx, req.Messages)
+	// Validate summary level
+	if req.SummaryLevel < 1 || req.SummaryLevel > 2 {
+		return nil, fmt.Errorf("invalid summary level: %d (must be 1 or 2)", req.SummaryLevel)
+	}
+
+	// 1. Создаём якоря (ключевые моменты)
+	anchors, err := s.createAnchors(ctx, req.Messages, req.SummaryLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create anchors: %w", err)
 	}
 
 	// 2. Создаём краткое резюме
-	briefSummary, tokensUsed, err := s.createBriefSummary(ctx, req.Messages, anchors)
+	briefSummary, tokensUsed, err := s.createBriefSummary(ctx, req.Messages, anchors, req.SummaryLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create brief summary: %w", err)
 	}
 
-	// 3. Сохраняем резюме
+	// 3. Определяем границы сжатия
+	var coversFromID, coversToID string
+	if len(req.Messages) > 0 {
+		coversFromID = req.Messages[0].ID
+		coversToID = req.Messages[len(req.Messages)-1].ID
+	}
+
+	// 4. Сохраняем резюме в БД
+	summaryID := uuid.New().String()
 	summary := models.Summary{
-		SessionID:    req.SessionID,
-		Anchors:      anchors,
-		BriefSummary: briefSummary,
-		UpdatedAt:    time.Now(),
+		ID:                  summaryID,
+		SessionID:           req.SessionID,
+		SummaryText:         briefSummary,
+		Anchors:             anchors,
+		SummaryLevel:        req.SummaryLevel,
+		CoversFromMessageID: coversFromID,
+		CoversToMessageID:   coversToID,
+		MessageCount:        len(req.Messages),
+		TokensUsed:          tokensUsed,
+		UpdatedAt:           time.Now(),
 	}
 
 	if err := s.summaryStore.SaveSummary(ctx, summary); err != nil {
@@ -130,28 +133,61 @@ func (s *Service) CreateSummary(ctx context.Context, req SummaryRequest) (*Summa
 
 	duration := time.Since(startTime)
 
-	s.logger.Info("Summary created successfully",
+	s.logger.Info("Multi-level summary created successfully",
 		zap.String("session_id", req.SessionID),
+		zap.String("summary_id", summaryID),
+		zap.Int("summary_level", req.SummaryLevel),
 		zap.Int("anchors_count", len(anchors)),
 		zap.Int("summary_length", len(briefSummary)),
 		zap.Int("tokens_used", tokensUsed),
-		zap.Int("compressed_messages", len(req.Messages)),
+		zap.Int("compressed_items", len(req.Messages)),
 		zap.Duration("duration", duration),
 	)
 
-	return &SummaryResponse{
+	response := &SummaryResponse{
 		SessionID:    req.SessionID,
+		SummaryID:    summaryID,
 		Anchors:      anchors,
 		BriefSummary: briefSummary,
+		SummaryLevel: req.SummaryLevel,
 		TokensUsed:   tokensUsed,
-		Compressed:   len(req.Messages),
-	}, nil
+		Duration:     duration,
+	}
+
+	// Устанавливаем соответствующие поля в зависимости от уровня
+	if req.SummaryLevel == 1 {
+		response.MessagesCompressed = len(req.Messages)
+	} else if req.SummaryLevel == 2 {
+		response.SummariesCompressed = len(req.Messages)
+	}
+
+	return response, nil
 }
 
-// createAnchors создаёт ключевые якоря из истории сообщений
-func (s *Service) createAnchors(ctx context.Context, messages []models.Message) ([]string, error) {
-	// Формируем промпт для создания якорей
-	systemPrompt := `Ты эксперт по анализу диалогов. Твоя задача - выделить ключевые моменты из разговора в виде коротких якорей.
+// createAnchors создаёт ключевые якоря из истории сообщений/резюме
+func (s *Service) createAnchors(ctx context.Context, messages []models.Message, summaryLevel int) ([]string, error) {
+	// Формируем промпт для создания якорей в зависимости от уровня
+	var systemPrompt string
+	if summaryLevel == 2 {
+		systemPrompt = `Ты эксперт по анализу диалогов. Твоя задача - выделить ключевые моменты из набора резюме в виде коротких якорей.
+
+Якорь - это краткая фраза (3-7 слов), которая отражает важную тему или группу тем из резюме.
+
+Правила:
+1. Создай ровно %d якорей
+2. Каждый якорь должен быть коротким и информативным
+3. Якоря должны отражать основные темы из всех резюме
+4. Используй тот же язык, что и в резюме
+5. Сконцентрируйся на самых важных и общих темах
+6. Отвечай только списком якорей, по одному на строке, без нумерации
+
+Пример хороших якорей для bulk summary:
+- "Обсуждение технических решений"
+- "Карьерное планирование"
+- "Анализ проектных задач"
+- "Рекомендации и советы"`
+	} else {
+		systemPrompt = `Ты эксперт по анализу диалогов. Твоя задача - выделить ключевые моменты из разговора в виде коротких якорей.
 
 Якорь - это краткая фраза (3-7 слов), которая отражает важную тему или поворотный момент в разговоре.
 
@@ -167,19 +203,23 @@ func (s *Service) createAnchors(ctx context.Context, messages []models.Message) 
 - "Проблемы с проектом"
 - "Рекомендации по книгам"
 - "Планы на выходные"`
+	}
 
 	systemPrompt = fmt.Sprintf(systemPrompt, s.config.AnchorsCount)
 
-	// Формируем контент диалога
+	// Формируем контент в зависимости от уровня
 	var dialogBuilder strings.Builder
-	dialogBuilder.WriteString("Диалог для анализа:\n\n")
-
-	for _, msg := range messages {
-		role := "Пользователь"
-		if msg.Role == "assistant" {
-			role = "Ассистент"
+	if summaryLevel == 2 {
+		dialogBuilder.WriteString("Резюме для анализа:\n\n")
+		for i, msg := range messages {
+			dialogBuilder.WriteString(fmt.Sprintf("Резюме %d: %s\n\n", i+1, msg.Content))
 		}
-		dialogBuilder.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+	} else {
+		dialogBuilder.WriteString("Диалог для анализа:\n\n")
+		for _, msg := range messages {
+			role := s.getRoleDisplayName(msg.Role)
+			dialogBuilder.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+		}
 	}
 
 	llmMessages := []llm.Message{
@@ -217,7 +257,8 @@ func (s *Service) createAnchors(ctx context.Context, messages []models.Message) 
 		anchors = anchors[:s.config.AnchorsCount]
 	}
 
-	s.logger.Debug("Created anchors",
+	s.logger.Debug("Created anchors for multi-level summary",
+		zap.Int("summary_level", summaryLevel),
 		zap.String("anchors_raw", anchorsText),
 		zap.Strings("anchors_parsed", anchors),
 	)
@@ -225,40 +266,63 @@ func (s *Service) createAnchors(ctx context.Context, messages []models.Message) 
 	return anchors, nil
 }
 
-// createBriefSummary создаёт краткое резюме диалога
-func (s *Service) createBriefSummary(ctx context.Context, messages []models.Message, anchors []string) (string, int, error) {
-	systemPrompt := `Ты эксперт по созданию кратких резюме диалогов. Создай краткое резюме разговора.
+// createBriefSummary создаёт краткое резюме в зависимости от уровня
+func (s *Service) createBriefSummary(ctx context.Context, messages []models.Message, anchors []string, summaryLevel int) (string, int, error) {
+	var systemPrompt string
+	if summaryLevel == 2 {
+		systemPrompt = `Ты эксперт по созданию кратких резюме. Создай краткое резюме из набора резюме диалогов.
+
+Требования:
+1. Резюме должно быть максимум %d символов
+2. Используй тот же язык, что и в исходных резюме
+3. Отражай основные темы и выводы из всех резюме
+4. Будь конкретным и информативным
+5. Создай обобщенное резюме, которое покрывает все важные аспекты
+6. Используй предоставленные якоря как ориентир
+
+Якоря для ориентира: %s
+
+Отвечай только текстом резюме, без дополнительных комментариев.`
+	} else {
+		systemPrompt = `Ты эксперт по созданию кратких резюме диалогов. Создай краткое резюме разговора.
 
 Требования:
 1. Резюме должно быть максимум %d символов
 2. Используй тот же язык, что и в диалоге
 3. Отражай основные темы и выводы
 4. Будь конкретным и информативным
-5. Используй предоставленные якоря как ориентир
+5. Включи важные детали и решения
+6. Используй предоставленные якоря как ориентир
 
 Якоря для ориентира: %s
 
 Отвечай только текстом резюме, без дополнительных комментариев.`
+	}
 
 	anchorsStr := strings.Join(anchors, ", ")
 	systemPrompt = fmt.Sprintf(systemPrompt, s.config.SummaryMaxLength, anchorsStr)
 
-	// Формируем контент диалога (берём каждое N-ное сообщение для краткости)
+	// Формируем контент для резюмирования
 	var dialogBuilder strings.Builder
-	dialogBuilder.WriteString("Диалог для резюмирования:\n\n")
-
-	step := 1
-	if len(messages) > 20 {
-		step = len(messages) / 20 // Берём примерно 20 сообщений
-	}
-
-	for i := 0; i < len(messages); i += step {
-		msg := messages[i]
-		role := "Пользователь"
-		if msg.Role == "assistant" {
-			role = "Ассистент"
+	if summaryLevel == 2 {
+		dialogBuilder.WriteString("Резюме для объединения:\n\n")
+		for i, msg := range messages {
+			dialogBuilder.WriteString(fmt.Sprintf("Резюме %d:\n%s\n\n", i+1, msg.Content))
 		}
-		dialogBuilder.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+	} else {
+		dialogBuilder.WriteString("Диалог для резюмирования:\n\n")
+
+		// Для первого уровня можем пропускать сообщения если их слишком много
+		step := 1
+		if len(messages) > 20 {
+			step = len(messages) / 20 // Берём примерно 20 сообщений
+		}
+
+		for i := 0; i < len(messages); i += step {
+			msg := messages[i]
+			role := s.getRoleDisplayName(msg.Role)
+			dialogBuilder.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+		}
 	}
 
 	llmMessages := []llm.Message{
@@ -282,7 +346,43 @@ func (s *Service) createBriefSummary(ctx context.Context, messages []models.Mess
 		summary = summary[:s.config.SummaryMaxLength-3] + "..."
 	}
 
+	s.logger.Debug("Created brief summary",
+		zap.Int("summary_level", summaryLevel),
+		zap.Int("summary_length", len(summary)),
+		zap.Int("tokens_used", response.Usage.TotalTokens),
+	)
+
 	return summary, response.Usage.TotalTokens, nil
+}
+
+// getRoleDisplayName возвращает отображаемое имя роли
+func (s *Service) getRoleDisplayName(role string) string {
+	switch role {
+	case "user":
+		return "Пользователь"
+	case "assistant":
+		return "Ассистент"
+	case "tool":
+		return "Инструмент"
+	case "system":
+		return "Система"
+	default:
+		return "Участник"
+	}
+}
+
+// ShouldCreateSummary определяет, нужно ли создавать резюме (deprecated, используется Context Manager)
+func (s *Service) ShouldCreateSummary(ctx context.Context, sessionID string, messageCount int) (bool, string) {
+	s.logger.Warn("ShouldCreateSummary is deprecated, use Context Manager instead",
+		zap.String("session_id", sessionID),
+		zap.Int("message_count", messageCount),
+	)
+
+	// Простая логика для обратной совместимости
+	if messageCount >= s.config.MaxMessagesBeforeSummary {
+		return true, "message_count_threshold"
+	}
+	return false, ""
 }
 
 // GetSummary получает существующее резюме для сессии
@@ -290,60 +390,43 @@ func (s *Service) GetSummary(ctx context.Context, sessionID string) (*models.Sum
 	return s.summaryStore.GetSummary(ctx, sessionID)
 }
 
-// UpdateSummary обновляет существующее резюме с новыми сообщениями
+// UpdateSummary обновляет существующее резюме с новыми сообщениями (deprecated)
 func (s *Service) UpdateSummary(ctx context.Context, sessionID string, newMessages []models.Message) (*SummaryResponse, error) {
-	// Получаем существующее резюме
-	existingSummary, err := s.summaryStore.GetSummary(ctx, sessionID)
-	if err != nil {
-		// Нет существующего резюме, создаём новое
-		return s.CreateSummary(ctx, SummaryRequest{
-			SessionID: sessionID,
-			Messages:  newMessages,
-			Reason:    "first_summary",
-		})
-	}
-
-	// Логируем информацию о существующем резюме
-	s.logger.Debug("Updating existing summary",
+	s.logger.Warn("UpdateSummary is deprecated, use CreateSummary with Context Manager instead",
 		zap.String("session_id", sessionID),
-		zap.Int("existing_anchors", len(existingSummary.Anchors)),
-		zap.Int("existing_summary_length", len(existingSummary.BriefSummary)),
-		zap.Time("last_updated", existingSummary.UpdatedAt),
 		zap.Int("new_messages", len(newMessages)),
 	)
 
-	// Создаём обновленное резюме с новыми сообщениями
-	req := SummaryRequest{
-		SessionID: sessionID,
-		Messages:  newMessages,
-		Reason:    "update_existing",
-	}
-
-	return s.CreateSummary(ctx, req)
+	// Создаём новое резюме для обратной совместимости
+	return s.CreateSummary(ctx, SummaryRequest{
+		SessionID:    sessionID,
+		Messages:     newMessages,
+		Reason:       "update_deprecated",
+		SummaryLevel: 1,
+	})
 }
 
-// GetContextForLLM формирует контекст для отправки в основной LLM
+// GetContextForLLM формирует контекст для отправки в основной LLM (deprecated)
 func (s *Service) GetContextForLLM(ctx context.Context, sessionID string, recentMessages []models.Message) ([]llm.Message, error) {
+	s.logger.Warn("GetContextForLLM is deprecated, use Context Manager instead",
+		zap.String("session_id", sessionID),
+		zap.Int("recent_messages", len(recentMessages)),
+	)
+
+	// Простая логика для обратной совместимости
 	var context []llm.Message
 
-	// 1. Получаем резюме если есть
+	// Пробуем получить резюме
 	summary, err := s.summaryStore.GetSummary(ctx, sessionID)
 	if err == nil && summary != nil {
-		// Добавляем резюме как системное сообщение
 		summaryText := s.formatSummaryForContext(summary)
 		context = append(context, llm.Message{
 			Role:    "system",
 			Content: summaryText,
 		})
-
-		s.logger.Debug("Added summary to context",
-			zap.String("session_id", sessionID),
-			zap.Int("anchors_count", len(summary.Anchors)),
-			zap.Int("summary_length", len(summary.BriefSummary)),
-		)
 	}
 
-	// 2. Добавляем недавние сообщения
+	// Добавляем недавние сообщения
 	recentLLMMessages := llm.ConvertToLLMMessages(recentMessages)
 	context = append(context, recentLLMMessages...)
 
@@ -354,7 +437,12 @@ func (s *Service) GetContextForLLM(ctx context.Context, sessionID string, recent
 func (s *Service) formatSummaryForContext(summary *models.Summary) string {
 	var builder strings.Builder
 
-	builder.WriteString("Контекст предыдущего разговора:\n\n")
+	levelName := "резюме"
+	if summary.SummaryLevel == 2 {
+		levelName = "обобщенное резюме"
+	}
+
+	builder.WriteString(fmt.Sprintf("Контекст предыдущего разговора (%s):\n\n", levelName))
 
 	if len(summary.Anchors) > 0 {
 		builder.WriteString("Ключевые темы:\n")
@@ -364,9 +452,13 @@ func (s *Service) formatSummaryForContext(summary *models.Summary) string {
 		builder.WriteString("\n")
 	}
 
-	if summary.BriefSummary != "" {
-		builder.WriteString("Краткое резюме:\n")
-		builder.WriteString(summary.BriefSummary)
+	if summary.SummaryText != "" {
+		if summary.SummaryLevel == 2 {
+			builder.WriteString("Краткое обобщение диалогов:\n")
+		} else {
+			builder.WriteString("Краткое резюме:\n")
+		}
+		builder.WriteString(summary.SummaryText)
 		builder.WriteString("\n\n")
 	}
 

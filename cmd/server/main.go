@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"LLM_Chat/internal/service/chat"
 	contextmgr "LLM_Chat/internal/service/context"
 	"LLM_Chat/internal/service/summary"
-	"LLM_Chat/internal/storage/memory"
+	"LLM_Chat/internal/storage/postgres"
 	"LLM_Chat/pkg/llm"
 	"LLM_Chat/pkg/llm/providers"
 
@@ -36,15 +37,17 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting chat-llm-mvp server with MCP Gemini support",
+	logger.Info("Starting chat-llm-mvp server with PostgreSQL and multi-level compression",
 		zap.String("host", cfg.Server.Host),
 		zap.Int("port", cfg.Server.Port),
 		zap.String("llm_provider", cfg.LLM.Provider),
 		zap.String("llm_model", cfg.LLM.Model),
 		zap.String("mcp_server", cfg.MCP.ServerURL),
-		zap.String("system_prompt_path", cfg.MCP.SystemPromptPath),
+		zap.String("database_url", maskDatabaseURL(cfg.Database.URL)),
 		zap.Int("context_window_size", cfg.Chat.ContextWindowSize),
-		zap.Int("max_messages_per_session", cfg.Chat.MaxMessagesPerSession),
+		zap.Float64("message_compression_ratio", cfg.Chat.MessageCompressionRatio),
+		zap.Float64("summary_compression_ratio", cfg.Chat.SummaryCompressionRatio),
+		zap.Bool("auto_migrate", cfg.Database.AutoMigrate),
 	)
 
 	// Валидация конфигурации LLM
@@ -66,9 +69,38 @@ func main() {
 		)
 	}
 
-	// Инициализация storage
-	storage := memory.New()
-	logger.Info("Initialized in-memory storage")
+	// Инициализация PostgreSQL storage
+	storage, err := postgres.New(cfg.Database.URL, logger)
+	if err != nil {
+		logger.Fatal("Failed to initialize PostgreSQL storage", zap.Error(err))
+	}
+	defer storage.Close()
+
+	logger.Info("PostgreSQL storage initialized successfully",
+		zap.String("database_url", maskDatabaseURL(cfg.Database.URL)),
+		zap.Int("max_open_conns", cfg.Database.MaxOpenConns),
+		zap.Int("max_idle_conns", cfg.Database.MaxIdleConns),
+	)
+
+	// Выполнение миграций
+	if cfg.Database.AutoMigrate {
+		logger.Info("Running database migrations...")
+		migrator := postgres.NewMigrator(storage.GetDB(), logger)
+
+		// Используем встроенные миграции
+		if err := migrator.RunMigrationsFromStrings(context.Background(), postgres.EmbeddedMigrations); err != nil {
+			logger.Fatal("Failed to run database migrations", zap.Error(err))
+		}
+
+		currentVersion, err := migrator.GetCurrentVersion(context.Background())
+		if err != nil {
+			logger.Warn("Failed to get current migration version", zap.Error(err))
+		} else {
+			logger.Info("Database migrations completed successfully", zap.Int("current_version", currentVersion))
+		}
+	} else {
+		logger.Info("Auto-migration is disabled, skipping migrations")
+	}
 
 	// Инициализация LLM клиентов с MCP поддержкой
 	mainLLMClient, err := initMCPLLMClient(cfg, logger, "main")
@@ -81,7 +113,7 @@ func main() {
 		logger.Fatal("Failed to initialize shrink LLM client", zap.Error(err))
 	}
 
-	logger.Info("Initialized MCP LLM clients",
+	logger.Info("MCP LLM clients initialized successfully",
 		zap.String("main_provider", mainLLMClient.GetProviderName()),
 		zap.String("main_model", cfg.LLM.Model),
 		zap.String("shrink_provider", shrinkLLMClient.GetProviderName()),
@@ -94,49 +126,55 @@ func main() {
 		zap.Strings("models", supportedModels),
 	)
 
-	// Инициализация Summary Service
+	// Инициализация Summary Service с поддержкой многоуровневого сжатия
 	summaryConfig := summary.DefaultConfig()
-	summaryConfig.MaxMessagesBeforeSummary = cfg.Chat.MaxMessagesPerSession
 	summaryConfig.ContextWindowSize = cfg.Chat.ContextWindowSize
 
 	summaryService := summary.NewService(
-		storage, // SummaryStore
+		storage, // ExtendedMessageStore (SummaryStore)
 		shrinkLLMClient,
 		summaryConfig,
 		logger,
 	)
-	logger.Info("Initialized summary service",
-		zap.Int("max_messages_before_summary", summaryConfig.MaxMessagesBeforeSummary),
+	logger.Info("Multi-level summary service initialized",
 		zap.Int("context_window_size", summaryConfig.ContextWindowSize),
 		zap.Int("anchors_count", summaryConfig.AnchorsCount),
+		zap.Int("summary_max_length", summaryConfig.SummaryMaxLength),
+		zap.Int("min_messages_for_summary", summaryConfig.MinMessagesForSummary),
 	)
 
-	// Инициализация Context Manager
+	// Инициализация Context Manager с многоуровневым сжатием
 	contextConfig := contextmgr.DefaultConfig()
 	contextConfig.ContextWindowSize = cfg.Chat.ContextWindowSize
 	contextConfig.MaxMessagesBeforeCompress = cfg.Chat.MaxMessagesPerSession
+	contextConfig.MessageCompressionRatio = cfg.Chat.MessageCompressionRatio
+	contextConfig.SummaryCompressionRatio = cfg.Chat.SummaryCompressionRatio
+	contextConfig.MinMessagesInWindow = cfg.Chat.MinMessagesInWindow
 
 	contextManager := contextmgr.NewManager(
-		storage, // MessageStore
+		storage, // ExtendedMessageStore
 		summaryService,
 		contextConfig,
 		logger,
 	)
-	logger.Info("Initialized context manager",
+	logger.Info("Multi-level context manager initialized",
 		zap.Int("context_window_size", contextConfig.ContextWindowSize),
 		zap.Int("max_messages_before_compress", contextConfig.MaxMessagesBeforeCompress),
+		zap.Float64("message_compression_ratio", contextConfig.MessageCompressionRatio),
+		zap.Float64("summary_compression_ratio", contextConfig.SummaryCompressionRatio),
+		zap.Int("min_messages_in_window", contextConfig.MinMessagesInWindow),
 	)
 
-	// Инициализация Chat Service с Context Manager
+	// Инициализация Chat Service с PostgreSQL и Context Manager
 	chatService := chat.NewService(
-		storage,        // MessageStore
-		storage,        // SessionStore
-		contextManager, // ContextManager
+		storage,        // ExtendedMessageStore (MessageStore)
+		storage,        // ExtendedMessageStore (SessionStore)
+		contextManager, // ContextManager с многоуровневым сжатием
 		mainLLMClient,  // Main LLM
 		&cfg.Chat,
 		logger,
 	)
-	logger.Info("Initialized chat service with context management")
+	logger.Info("Chat service with PostgreSQL and multi-level compression initialized")
 
 	// Инициализация handlers
 	chatHandler := handlers.NewChatHandler(chatService, storage, logger)
@@ -157,7 +195,7 @@ func main() {
 
 	// Запуск сервера в отдельной горутине
 	go func() {
-		logger.Info("Server starting", zap.String("addr", server.Addr))
+		logger.Info("Server starting with PostgreSQL backend", zap.String("addr", server.Addr))
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("Failed to start server", zap.Error(err))
 		}
@@ -165,6 +203,11 @@ func main() {
 
 	// Логируем информацию о конфигурации
 	logConfigInfo(cfg, logger)
+
+	// Проверяем подключение к базе данных
+	if err := testDatabaseConnection(storage, logger); err != nil {
+		logger.Fatal("Database connection test failed", zap.Error(err))
+	}
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
@@ -180,14 +223,14 @@ func main() {
 		logger.Error("Server forced to shutdown", zap.Error(err))
 	}
 
-	logger.Info("Server stopped")
+	logger.Info("Server stopped gracefully")
 }
 
 func initMCPLLMClient(cfg *config.Config, logger *zap.Logger, clientType string) (*llm.Client, error) {
-	// Одна строка вместо трех блоков!
 	providerConfig := cfg.ToProviderConfig()
 	mcpConfig := cfg.ToMCPConfig()
 
+	// Создаем MCP Gemini провайдер
 	factory := providers.NewFactory(logger.With(zap.String("llm_client", clientType)))
 	provider, err := factory.CreateProviderWithMCP(providerConfig, mcpConfig)
 	if err != nil {
@@ -198,13 +241,57 @@ func initMCPLLMClient(cfg *config.Config, logger *zap.Logger, clientType string)
 	return client, nil
 }
 
+func testDatabaseConnection(storage *postgres.PostgresStorage, logger *zap.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Попробуем выполнить простой запрос
+	if err := storage.CreateSession(ctx, "test-connection-"+fmt.Sprintf("%d", time.Now().Unix())); err != nil {
+		return fmt.Errorf("failed to create test session: %w", err)
+	}
+
+	logger.Info("Database connection test passed successfully")
+	return nil
+}
+
+func maskDatabaseURL(dbURL string) string {
+	// Маскируем пароль в URL для логирования
+	if dbURL == "" {
+		return ""
+	}
+
+	// Простая маскировка - заменяем всё между :// и @
+	parts := strings.Split(dbURL, "://")
+	if len(parts) != 2 {
+		return dbURL
+	}
+
+	afterProtocol := parts[1]
+	atIndex := strings.Index(afterProtocol, "@")
+	if atIndex == -1 {
+		return dbURL
+	}
+
+	// Находим первое двоеточие после протокола
+	colonIndex := strings.Index(afterProtocol, ":")
+	if colonIndex == -1 || colonIndex > atIndex {
+		return dbURL
+	}
+
+	username := afterProtocol[:colonIndex]
+	afterAt := afterProtocol[atIndex:]
+
+	return fmt.Sprintf("%s://%s:***%s", parts[0], username, afterAt)
+}
+
 func logConfigInfo(cfg *config.Config, logger *zap.Logger) {
 	configSources := config.GetConfigSource(cfg)
 
-	logger.Info("Configuration loaded",
+	logger.Info("Configuration loaded successfully",
 		zap.String("config_file", configSources["config_file"]),
 		zap.String("api_key_source", configSources["api_key"]),
 		zap.String("provider", configSources["provider"]),
+		zap.String("database_source", configSources["database"]),
 		zap.String("mcp_server", configSources["mcp_server"]),
 		zap.String("system_prompt", configSources["system_prompt"]),
 	)
@@ -212,13 +299,21 @@ func logConfigInfo(cfg *config.Config, logger *zap.Logger) {
 	// Логируем рекомендуемые переменные окружения
 	geminiEnvVars := config.GetGeminiEnvVars()
 	mcpEnvVars := config.GetMCPEnvVars()
+	dbEnvVars := config.GetDatabaseEnvVars()
 
-	logger.Info("Environment variables for Gemini",
+	logger.Info("Environment variables guide",
 		zap.Strings("gemini_env_vars", geminiEnvVars),
+		zap.Strings("mcp_env_vars", mcpEnvVars),
+		zap.Strings("database_env_vars", dbEnvVars),
 	)
 
-	logger.Info("Environment variables for MCP",
-		zap.Strings("mcp_env_vars", mcpEnvVars),
+	// Логируем конфигурацию многоуровневого сжатия
+	logger.Info("Multi-level compression configuration",
+		zap.Int("context_window_size", cfg.Chat.ContextWindowSize),
+		zap.Float64("message_compression_ratio", cfg.Chat.MessageCompressionRatio),
+		zap.Float64("summary_compression_ratio", cfg.Chat.SummaryCompressionRatio),
+		zap.Int("min_messages_in_window", cfg.Chat.MinMessagesInWindow),
+		zap.Int("max_messages_per_session", cfg.Chat.MaxMessagesPerSession),
 	)
 }
 
