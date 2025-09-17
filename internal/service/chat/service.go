@@ -96,13 +96,8 @@ func (s *Service) ProcessMessage(ctx context.Context, req ProcessMessageRequest)
 	}
 
 	// 3. Сохраняем сообщение пользователя
-	userMessage := models.Message{
-		ID:        uuid.New().String(),
-		SessionID: req.SessionID,
-		Role:      "user",
-		Content:   req.Message,
-		Timestamp: time.Now(),
-	}
+	userMessage := models.NewUserMessage(req.SessionID, req.Message)
+	userMessage.ID = uuid.New().String()
 
 	if err := s.messageStore.SaveMessage(ctx, userMessage); err != nil {
 		return nil, fmt.Errorf("failed to save user message: %w", err)
@@ -141,18 +136,20 @@ func (s *Service) ProcessMessage(ctx context.Context, req ProcessMessageRequest)
 	assistantContent := llmResponse.Choices[0].Message.Content
 
 	// 6. Сохраняем ответ ассистента
-	assistantMessage := models.Message{
-		ID:        uuid.New().String(),
-		SessionID: req.SessionID,
-		Role:      "assistant",
-		Content:   assistantContent,
-		Timestamp: time.Now(),
-		Metadata: models.Metadata{
-			Tokens: llmResponse.Usage.TotalTokens,
-			Model:  llmResponse.Model,
-			Cost:   s.calculateCost(llmResponse.Usage.TotalTokens),
-		},
+	assistantMessage := models.NewAssistantMessage(req.SessionID, assistantContent)
+	assistantMessage.ID = uuid.New().String()
+	assistantMessage.Metadata = models.Metadata{
+		Tokens: llmResponse.Usage.TotalTokens,
+		Model:  llmResponse.Model,
+		Cost:   s.calculateCost(llmResponse.Usage.TotalTokens),
 	}
+
+	s.logger.Debug("Creating assistant message",
+		zap.String("message_id", assistantMessage.ID),
+		zap.String("session_id", assistantMessage.SessionID),
+		zap.String("role", assistantMessage.Role),
+		zap.String("message_type", assistantMessage.MessageType),
+	)
 
 	if err := s.messageStore.SaveMessage(ctx, assistantMessage); err != nil {
 		return nil, fmt.Errorf("failed to save assistant message: %w", err)
@@ -217,13 +214,8 @@ func (s *Service) ProcessMessageStream(ctx context.Context, req ProcessMessageRe
 		}
 
 		// 3. Сохраняем сообщение пользователя
-		userMessage := models.Message{
-			ID:        uuid.New().String(),
-			SessionID: req.SessionID,
-			Role:      "user",
-			Content:   req.Message,
-			Timestamp: time.Now(),
-		}
+		userMessage := models.NewUserMessage(req.SessionID, req.Message)
+		userMessage.ID = uuid.New().String()
 
 		if err := s.messageStore.SaveMessage(ctx, userMessage); err != nil {
 			responseCh <- StreamResponse{Error: fmt.Errorf("failed to save user message: %w", err)}
