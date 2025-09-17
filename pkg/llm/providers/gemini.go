@@ -382,17 +382,22 @@ func (p *MCPGeminiProvider) ChatCompletionStream(ctx context.Context, messages [
 
 // callMCPTool вызывает MCP инструмент
 func (p *MCPGeminiProvider) callMCPTool(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
-	p.logger.Debug("Calling MCP tool", zap.String("name", name))
-
 	if args == nil {
 		args = map[string]any{}
 	}
+
+	p.logger.Info(
+		"MCP tool request",
+		zap.String("tool_name", name),
+		zap.Any("arguments", args),
+	)
 
 	res, err := p.session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      name,
 		Arguments: args,
 	})
 	if err != nil {
+		p.logger.Error("MCP tool call failed", zap.String("tool_name", name), zap.Error(err))
 		return nil, fmt.Errorf("tool call failed: %w", err)
 	}
 
@@ -404,35 +409,47 @@ func (p *MCPGeminiProvider) callMCPTool(ctx context.Context, name string, args m
 				break
 			}
 		}
-		return map[string]any{"error": msg}, nil
+		result := map[string]any{"error": msg}
+		p.logger.Warn("MCP tool returned error", zap.String("tool_name", name), zap.Any("response", result))
+		return result, nil
 	}
+
+	var result map[string]any
 
 	if res.StructuredContent != nil {
 		switch v := res.StructuredContent.(type) {
 		case map[string]any:
-			return v, nil
+			result = v
 		default:
 			b, _ := json.Marshal(v)
 			m := map[string]any{}
 			if err := json.Unmarshal(b, &m); err == nil {
-				return m, nil
+				result = m
+			} else {
+				result = map[string]any{"result": string(b)}
 			}
-			return map[string]any{"result": string(b)}, nil
+		}
+	} else {
+		var sb strings.Builder
+		for _, ct := range res.Content {
+			if tc, ok := ct.(*mcp.TextContent); ok {
+				sb.WriteString(tc.Text)
+				sb.WriteString("\n")
+			}
+		}
+		out := strings.TrimSpace(sb.String())
+		if out != "" {
+			result = map[string]any{"result": out}
 		}
 	}
 
-	var sb strings.Builder
-	for _, ct := range res.Content {
-		if tc, ok := ct.(*mcp.TextContent); ok {
-			sb.WriteString(tc.Text)
-			sb.WriteString("\n")
-		}
+	if result == nil {
+		result = map[string]any{"result": nil}
 	}
-	out := strings.TrimSpace(sb.String())
-	if out != "" {
-		return map[string]any{"result": out}, nil
-	}
-	return map[string]any{"result": nil}, nil
+
+	p.logger.Info("MCP tool response", zap.String("tool_name", name), zap.Any("response", result))
+
+	return result, nil
 }
 
 func (p *MCPGeminiProvider) httpClientWithHeaders(headers map[string]string) *http.Client {
